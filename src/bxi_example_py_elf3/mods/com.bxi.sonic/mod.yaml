@@ -115,13 +115,12 @@ states:
       idle_frame_start: 3509
       source_blend_seconds: 0.4
       hardware_gripper: true
-      gripper_input_timeout_s: 0.2
-      gripper_release_threshold: 0.05
+      gripper_enable_interval_s: 1.0
       gripper_left_bus: 5
       gripper_right_bus: 6
       gripper_can_id: 1
-      gripper_kp: 20.0
-      gripper_kd: 1.0
+      gripper_kp: 10.0
+      gripper_kd: 0.5
 
 routes:
   - from: com.bxi.basic_actions/normal
