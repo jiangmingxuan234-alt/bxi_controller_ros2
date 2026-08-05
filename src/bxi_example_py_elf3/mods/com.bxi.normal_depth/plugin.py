@@ -85,8 +85,8 @@ def _build_normal_depth_state(
 
 
 def create_mod(context: ModLoadContext) -> ModDefinition:
-    context.register_resource(LEGACY_POLICY, _load_legacy_policy, policy="startup")
-    context.register_resource(ORIGIN_POLICY, _load_origin_policy, policy="startup")
+    context.register_resource(LEGACY_POLICY, _load_legacy_policy, policy="on_demand")
+    context.register_resource(ORIGIN_POLICY, _load_origin_policy, policy="on_demand")
     legacy_policy = context.resource(LEGACY_POLICY)
     origin_policy = context.resource(ORIGIN_POLICY)
 

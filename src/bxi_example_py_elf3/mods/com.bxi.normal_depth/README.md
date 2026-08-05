@@ -63,6 +63,9 @@ ROI。`NormalDepthState.depth_image_callback()` 缓存 `CameraInfo`，并在 ROS
 `[0.2, 3.0] m`；`depth_walk` 默认生成旋转前 `64x36`、FOV
 `89.24° x 58.06°`、距离 `[0.2, 2.5] m`。这些值都可在状态参数中覆盖。
 
+`origin_camera` 同时支持循环 ONNX 策略的 `h_in/h_out`。隐状态在进入状态时
+清零，只有真实推理帧会推进，Transition 预览不会修改已提交的隐状态。
+
 ## RKNN INT8 校准数据
 
 策略代码不包含采集线程或监控分支。使用通用采集工具包装控制器：

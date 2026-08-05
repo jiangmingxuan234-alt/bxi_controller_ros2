@@ -206,6 +206,8 @@ class HumanoidGaitDepthPolicyIsaaclab(JointPolicy):
             self._selected_depth.fill(0.0)
         if hasattr(self, "_single_input_buffer"):
             self._single_input_buffer.fill(0.0)
+        if hasattr(self, "_recurrent_state"):
+            self._recurrent_state.fill(0.0)
         self._previous_action.fill(0.0)
         self._action.fill(0.0)
         np.copyto(self._target, self._parameters.default_position)
@@ -250,6 +252,11 @@ class HumanoidGaitDepthPolicyIsaaclab(JointPolicy):
             advance=advance,
         )
         ort_outputs = self._backend.run(self._policy_inputs)
+        if advance and self.recurrent_output_name is not None:
+            np.copyto(
+                self._recurrent_state,
+                ort_outputs[self.recurrent_output_name],
+            )
         action_out = np.asarray(ort_outputs[self.action_output_name]).reshape(-1)
         np.clip(
             action_out[: self.num_actions],
@@ -455,6 +462,8 @@ class HumanoidGaitDepthPolicyIsaaclab(JointPolicy):
     def _configure_model_io(self):
         inputs = self._backend.input_names
         outputs = self._backend.output_names
+        if not inputs or not outputs:
+            raise ValueError("Depth policy model must declare inputs and outputs")
         self.input_name = inputs[0]
         action_output_index = 0
         for i, output_name in enumerate(outputs):
@@ -462,6 +471,9 @@ class HumanoidGaitDepthPolicyIsaaclab(JointPolicy):
             if any(token in out_name for token in ("action", "actions", "policy")):
                 action_output_index = i
         self.action_output_name = outputs[action_output_index]
+        self.recurrent_input_name = None
+        self.recurrent_output_name = None
+        self.recurrent_state_shape = None
 
         self.model_input_mode = "history_only"
         self.obs_input_name = self.input_name
@@ -486,6 +498,35 @@ class HumanoidGaitDepthPolicyIsaaclab(JointPolicy):
         self.model_input_mode = "multi_input_history"
         self.obs_input_name = inputs[0]
         self.depth_input_name = inputs[1]
+        recurrent_inputs = inputs[2:]
+        if len(recurrent_inputs) > 1:
+            raise ValueError(
+                "Depth policy supports at most one recurrent input, got "
+                f"{recurrent_inputs}"
+            )
+        if recurrent_inputs:
+            recurrent_outputs = tuple(
+                name for name in outputs if name != self.action_output_name
+            )
+            if len(recurrent_outputs) != 1:
+                raise ValueError(
+                    "Recurrent depth policy must have one state output in "
+                    f"addition to actions, got {recurrent_outputs}"
+                )
+            self.recurrent_input_name = recurrent_inputs[0]
+            self.recurrent_output_name = recurrent_outputs[0]
+            input_state_shape = self._resolve_recurrent_shape(
+                self._backend.input_shape(self.recurrent_input_name)
+            )
+            output_state_shape = self._resolve_recurrent_shape(
+                self._backend.output_shape(self.recurrent_output_name)
+            )
+            if input_state_shape != output_state_shape:
+                raise ValueError(
+                    "Recurrent depth policy state shape mismatch: "
+                    f"input={input_state_shape}, output={output_state_shape}"
+                )
+            self.recurrent_state_shape = input_state_shape
         self.history_length = int(
             self._shape_dim(self._backend.input_shape(inputs[0])[1]) / self.num_obs
         )
@@ -535,26 +576,31 @@ class HumanoidGaitDepthPolicyIsaaclab(JointPolicy):
             self._policy_inputs = {
                 self.input_name: self.actor_obs_buffer.reshape(1, -1),
             }
-            return
-        if self.model_input_mode == "single_obs_depth":
+        elif self.model_input_mode == "single_obs_depth":
             self._single_input_buffer = np.empty(
                 (1, self.num_obs + self._selected_depth.size),
                 dtype=np.float32,
             )
             self._single_input_buffer.fill(0.0)
             self._policy_inputs = {self.input_name: self._single_input_buffer}
-            return
-        depth_view = (
-            self._selected_depth[-1].reshape(1, self.depth_h, self.depth_w)
-            if self.depth_input_rank == 3
-            else self._selected_depth.reshape(
-                1, self.depth_obs_indices.size, self.depth_h, self.depth_w
+        else:
+            depth_view = (
+                self._selected_depth[-1].reshape(1, self.depth_h, self.depth_w)
+                if self.depth_input_rank == 3
+                else self._selected_depth.reshape(
+                    1, self.depth_obs_indices.size, self.depth_h, self.depth_w
+                )
             )
-        )
-        self._policy_inputs = {
-            self.obs_input_name: self.actor_obs_buffer.reshape(1, -1),
-            self.depth_input_name: depth_view,
-        }
+            self._policy_inputs = {
+                self.obs_input_name: self.actor_obs_buffer.reshape(1, -1),
+                self.depth_input_name: depth_view,
+            }
+        if self.recurrent_input_name is not None:
+            self._recurrent_state = np.zeros(
+                self.recurrent_state_shape,
+                dtype=np.float32,
+            )
+            self._policy_inputs[self.recurrent_input_name] = self._recurrent_state
 
     def _warmup_depth_preprocessing(self) -> None:
         """Move lazy OpenCV initialization out of the first control cycle."""
@@ -580,6 +626,26 @@ class HumanoidGaitDepthPolicyIsaaclab(JointPolicy):
         if isinstance(dim, str):
             raise ValueError(f"Dynamic ONNX dimension is unsupported here: {dim}")
         return int(dim)
+
+    @staticmethod
+    def _resolve_recurrent_shape(shape):
+        resolved = []
+        for dimension in shape:
+            if isinstance(dimension, int):
+                if dimension <= 0:
+                    raise ValueError(
+                        "Recurrent depth policy dimensions must be positive, "
+                        f"got {shape}"
+                    )
+                resolved.append(dimension)
+            elif isinstance(dimension, str) and "batch" in dimension.lower():
+                resolved.append(1)
+            else:
+                raise ValueError(
+                    "Unsupported recurrent depth policy dimension "
+                    f"{dimension!r} in {shape}"
+                )
+        return tuple(resolved)
 
     @staticmethod
     def _resolve_policy_path(path):
