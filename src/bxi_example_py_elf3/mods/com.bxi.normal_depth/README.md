@@ -12,25 +12,26 @@ ros2 launch bxi_depth_camera cameras.launch.py
 话题结构，仅沿用 launch 已有的环境前缀：
 
 ```text
-/simulation/body_depth_camera/depth/image_rect_raw
-/simulation/body_depth_camera/depth/camera_info
+/simulation/head_depth_camera/depth/image_rect_raw
+/simulation/head_depth_camera/depth/camera_info
 
-/hardware/body_depth_camera/depth/image_rect_raw
-/hardware/body_depth_camera/depth/camera_info
+/hardware/head_depth_camera/depth/image_rect_raw
+/hardware/head_depth_camera/depth/camera_info
 ```
 
 MuJoCo 与真机均采用相同的 ROS 流级目录。状态只根据 `/topic_prefix` 替换
 `simulation` 或 `hardware`，不需要为两种环境单独配置话题。
 
-策略只使用 MuJoCo XML 中的逻辑名称 `body_depth_camera`。每台真机通过相机管理器参数
-`cameras.body_depth_camera.serial_no` 把这个逻辑位置映射到实际设备序列号。
+策略使用 MuJoCo XML 中的逻辑名称 `head_depth_camera`。单相机真机会由相机管理器
+自动回退到该名称；多相机部署通过 `cameras.head_depth_camera.serial_no` 把这个逻辑
+位置映射到实际设备序列号。
 
 ## 选择策略相机
 
 在 `mod.yaml` 的 `states.normal_depth.params` 中配置逻辑相机名：
 
 ```yaml
-camera_name: body_depth_camera
+camera_name: head_depth_camera
 topic: ""
 camera_info_topic: ""
 ```

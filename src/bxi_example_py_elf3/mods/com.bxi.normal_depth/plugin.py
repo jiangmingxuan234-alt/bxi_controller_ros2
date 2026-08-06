@@ -75,7 +75,7 @@ def _build_normal_depth_state(
         state.state_id,
         policy,
         mode=mode,
-        camera_name=state.string_param("camera_name", "body_depth_camera"),
+        camera_name=state.string_param("camera_name", "head_depth_camera"),
         depth_image_topic=state.string_param("topic", ""),
         camera_info_topic=state.string_param("camera_info_topic", ""),
         depth_uint16_scale=state.float_param("depth_uint16_scale", 0.001),
