@@ -162,6 +162,7 @@ def _run_controller_loop(
     period = 1.0 / rate_hz
     next_tick = time.monotonic()
     read_errors = 0
+    last_buttons: tuple[bool, bool] | None = None
     while not stop_event.is_set():
         now = time.monotonic()
         if now < next_tick:
@@ -169,10 +170,24 @@ def _run_controller_loop(
             continue
         next_tick = max(next_tick + period, now)
         try:
-            changed = tracking_gate.update(
-                bool(xrt.get_A_button()),
-                bool(xrt.get_X_button()),
-            )
+            a_pressed = bool(xrt.get_A_button())
+            x_pressed = bool(xrt.get_X_button())
+            buttons = (a_pressed, x_pressed)
+            if buttons != last_buttons:
+                if last_buttons is not None or a_pressed or x_pressed:
+                    print(
+                        "PICO controller buttons: "
+                        f"A={'DOWN' if a_pressed else 'UP'}, "
+                        f"X={'DOWN' if x_pressed else 'UP'}",
+                        flush=True,
+                    )
+                if a_pressed and x_pressed:
+                    print(
+                        "PICO A+X raw combo detected by XRoboToolkit",
+                        flush=True,
+                    )
+                last_buttons = buttons
+            changed = tracking_gate.update(a_pressed, x_pressed)
             read_errors = 0
         except Exception as exc:
             read_errors += 1
