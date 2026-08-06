@@ -10,13 +10,20 @@ import numpy as np
 
 from bxi_example_py_elf3.policies.joints import ELF3_ISAAC_JOINTS
 
+try:
+    from .head_tracking import HEAD_JOINT_NAMES
+except ImportError:  # Direct execution by pico_gmr_launcher.py.
+    from head_tracking import HEAD_JOINT_NAMES
+
 
 MAGIC = b"PGMR"
-VERSION = 1
+VERSION = 2
 REFERENCE_WINDOW_SIZE = 21
 REFERENCE_JOINT_NAMES = ELF3_ISAAC_JOINTS.names
-REFERENCE_FLOAT_COUNT = len(REFERENCE_JOINT_NAMES) + 4 + 3 + 3
-LAYOUT_CRC32 = zlib.crc32("\0".join(REFERENCE_JOINT_NAMES).encode("utf-8"))
+REFERENCE_FLOAT_COUNT = len(REFERENCE_JOINT_NAMES) + len(HEAD_JOINT_NAMES) + 4 + 3 + 3
+LAYOUT_CRC32 = zlib.crc32(
+    "\0".join((*REFERENCE_JOINT_NAMES, *HEAD_JOINT_NAMES)).encode("utf-8")
+)
 _HEADER = struct.Struct("!4sHHIQQQ")
 PACKET_SIZE = _HEADER.size + REFERENCE_FLOAT_COUNT * 4
 
@@ -27,6 +34,7 @@ class LiveReferenceFrame:
     sequence: int
     source_timestamp_ns: int
     joint_pos: np.ndarray
+    head_joint_pos: np.ndarray
     anchor_quat_wxyz: np.ndarray
     anchor_lin_vel_w: np.ndarray
     anchor_ang_vel_w: np.ndarray
@@ -43,6 +51,7 @@ def _finite(name: str, value: object, shape: tuple[int, ...]) -> np.ndarray:
 
 def encode_reference_frame(frame: LiveReferenceFrame) -> bytes:
     joints = _finite("joint_pos", frame.joint_pos, (len(REFERENCE_JOINT_NAMES),))
+    head_joints = _finite("head_joint_pos", frame.head_joint_pos, (len(HEAD_JOINT_NAMES),))
     quat = _finite("anchor_quat_wxyz", frame.anchor_quat_wxyz, (4,))
     norm = float(np.linalg.norm(quat))
     if norm <= np.finfo(np.float32).eps:
@@ -50,7 +59,9 @@ def encode_reference_frame(frame: LiveReferenceFrame) -> bytes:
     quat = quat / norm
     lin_vel = _finite("anchor_lin_vel_w", frame.anchor_lin_vel_w, (3,))
     ang_vel = _finite("anchor_ang_vel_w", frame.anchor_ang_vel_w, (3,))
-    payload = np.concatenate((joints, quat, lin_vel, ang_vel)).astype(">f4", copy=False)
+    payload = np.concatenate((joints, head_joints, quat, lin_vel, ang_vel)).astype(
+        ">f4", copy=False
+    )
     header = _HEADER.pack(
         MAGIC,
         VERSION,
@@ -79,9 +90,10 @@ def decode_reference_frame(packet: bytes) -> LiveReferenceFrame:
     if not np.isfinite(values).all():
         raise ValueError("PICO GMR packet contains NaN or infinity")
     joint_end = len(REFERENCE_JOINT_NAMES)
-    quat_end = joint_end + 4
+    head_end = joint_end + len(HEAD_JOINT_NAMES)
+    quat_end = head_end + 4
     lin_end = quat_end + 3
-    quat = values[joint_end:quat_end].copy()
+    quat = values[head_end:quat_end].copy()
     norm = float(np.linalg.norm(quat))
     if norm <= np.finfo(np.float32).eps:
         raise ValueError("PICO GMR packet contains a zero-length quaternion")
@@ -91,6 +103,7 @@ def decode_reference_frame(packet: bytes) -> LiveReferenceFrame:
         sequence=sequence,
         source_timestamp_ns=source_ns,
         joint_pos=values[:joint_end].copy(),
+        head_joint_pos=values[joint_end:head_end].copy(),
         anchor_quat_wxyz=quat,
         anchor_lin_vel_w=values[quat_end:lin_end].copy(),
         anchor_ang_vel_w=values[lin_end:].copy(),
@@ -99,6 +112,7 @@ def decode_reference_frame(packet: bytes) -> LiveReferenceFrame:
 
 __all__ = [
     "LiveReferenceFrame",
+    "HEAD_JOINT_NAMES",
     "PACKET_SIZE",
     "REFERENCE_JOINT_NAMES",
     "REFERENCE_WINDOW_SIZE",

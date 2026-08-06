@@ -154,6 +154,11 @@ states:
       stale_timeout_s: 0.4
       reference_yaw_mode: initial
       backend: auto
+      head_pitch_limit_rad: 0.5
+      head_yaw_limit_rad: 1.0
+      head_pitch_speed_rad_s: 1.5
+      head_yaw_speed_rad_s: 2.0
+      head_deadband_rad: 0.015
     manifest:
       label: PICO GMR任意动作
       priority: 875

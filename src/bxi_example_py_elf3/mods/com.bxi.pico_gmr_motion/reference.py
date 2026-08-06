@@ -27,6 +27,7 @@ class ReferenceWindow:
     latest_sequence: int
     received_monotonic: float
     joint_pos: np.ndarray
+    head_joint_pos: np.ndarray
     anchor_quat_wxyz: np.ndarray
     anchor_lin_vel_w: np.ndarray
     anchor_ang_vel_w: np.ndarray
@@ -83,6 +84,7 @@ class ReferenceWindowBuffer:
             latest_sequence=frames[-1].sequence,
             received_monotonic=items[-1][1],
             joint_pos=np.stack([frame.joint_pos for frame in frames]),
+            head_joint_pos=np.stack([frame.head_joint_pos for frame in frames]),
             anchor_quat_wxyz=np.stack([frame.anchor_quat_wxyz for frame in frames]),
             anchor_lin_vel_w=np.stack([frame.anchor_lin_vel_w for frame in frames]),
             anchor_ang_vel_w=np.stack([frame.anchor_ang_vel_w for frame in frames]),

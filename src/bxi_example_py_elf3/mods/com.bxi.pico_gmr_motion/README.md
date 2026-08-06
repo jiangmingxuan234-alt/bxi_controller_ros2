@@ -13,8 +13,8 @@ Runtime pipeline:
 3. Unity poses are converted to the right-handed convention used by MoCapLab.
 4. A compact two-stage GMR solver applies `pico_to_elf3.json` to the current
    package `data/mujoco_simulation/elf3.xml` model.
-5. Versioned UDP packets carry named-layout 29-joint poses plus torso
-   orientation and finite-difference velocities.
+5. Versioned UDP packets carry named-layout 29-joint poses, two PICO head
+   targets, torso orientation and finite-difference velocities.
 6. The state starts in RGMT standing-reference mode and waits indefinitely;
    connecting or wearing the headset does not trigger a state transition.
 7. Pressing PICO `A+X` enables tracking and starts a new 21-frame session.
@@ -87,6 +87,44 @@ keyframe, and resetting to its all-zero configuration would place both elbow
 joints at an L-shaped branch instead of the standing values near `1.28 rad`.
 The standing pose is only an IK initial condition; it is never added to the
 retargeted output.
+
+## PICO 头部跟踪
+
+实时跟踪打开后，Mod 还会读取 XRoboToolkit body tracking 中的 `Spine3` 和
+`Head` 四元数。头部命令不使用世界绝对姿态，而是先计算：
+
+```text
+q_relative = inverse(q_Spine3) * q_Head
+```
+
+随后沿用 `BXI_Elf3_MoCapLab/general_motion_retargeting/neck_retarget.py` 识别出的
+两个相对旋转轴，并按照当前 ELF3 头部电机的实际正方向修正符号：相对 XYZ roll
+的相反数驱动 `head_y_joint`（俯仰），相对 XYZ pitch 驱动 `head_z_joint`（偏航）。
+因此人向左、右、上、下转头时机器人摄像头同向运动；人转动整个身体而头部相对
+胸口不动时，也不会错误地让机器人单独转头。
+
+每次按 A+X 开启新 tracking session 后，第一帧相对姿态会自动作为 `(0, 0)` 中心。
+这样可以消除头显佩戴角度和自然低头造成的固定偏置；再次关闭并开启 A+X 会重新
+校准。启动跟踪时应保持头部朝向希望作为机器人正前方的方向。
+
+UDP 协议当前为 v2，头部字段按以下具名顺序传输：
+
+```text
+head_y_joint, head_z_joint
+```
+
+控制状态把 RGMT policy 的 29 关节输出与头部 2 关节组成具名 31 关节命令。31
+关节 ELF3 会执行头部目标；没有头部电机的 29 关节布局会按名称自动忽略这两个
+额外关节，不依赖固定数字下标。头部使用平台默认 PD 增益 `kp=16.747`、
+`kd=1.066`。默认安全参数为：
+
+- 俯仰范围 `[-0.5, 0.5] rad`，最大速度 `1.5 rad/s`；
+- 偏航范围 `[-1.0, 1.0] rad`，最大速度 `2.0 rad/s`；
+- 中心死区 `0.015 rad`。
+
+这些参数可在 `mod.yaml` 的 `states.pico_gmr_motion.params` 下调整。PICO 未连接、
+未按 A+X、21 帧窗口尚未收满或数据断流时，头部会按速度限制平滑回到零位，RGMT
+身体控制仍继续使用站立参考。
 
 ## 头部相机 RTSP 推流
 

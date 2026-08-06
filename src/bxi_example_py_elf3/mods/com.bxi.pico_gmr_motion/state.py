@@ -8,6 +8,10 @@ import numpy as np
 
 from bxi_example_py_elf3.framework.joints import CompiledJointMap
 from bxi_example_py_elf3.framework.mod_api import (
+    JointCommandComposer,
+    JointCommandLayer,
+    JointLayout,
+    JointTargetBuffer,
     ResourceHandle,
     RobotControlState,
     StateBehavior,
@@ -19,11 +23,18 @@ from bxi_example_py_elf3.framework.mod_api.transition import (
 )
 from bxi_example_py_elf3.policies.joints import ELF3_ISAAC_JOINTS
 
+from .head_tracking import HEAD_JOINT_NAMES
 from .reference import LiveReferenceReceiver, ReferenceWindow
 from .rgmt_policy import RgmtExternalReferencePolicy
 
 if TYPE_CHECKING:
     from bxi_example_py_elf3.framework.mod_api import RobotControlContext
+
+PICO_HEAD_JOINTS = JointLayout(HEAD_JOINT_NAMES, label="PICO head command")
+PICO_GMR_OUTPUT_JOINTS = JointLayout(
+    (*ELF3_ISAAC_JOINTS.names, *PICO_HEAD_JOINTS.names),
+    label="PICO GMR state output",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +44,11 @@ class PicoGmrMotionParams:
     stale_timeout_s: float = 0.4
     reference_yaw_mode: str = "initial"
     backend: str = "auto"
+    head_pitch_limit_rad: float = 0.5
+    head_yaw_limit_rad: float = 1.0
+    head_pitch_speed_rad_s: float = 1.5
+    head_yaw_speed_rad_s: float = 2.0
+    head_deadband_rad: float = 0.015
 
     def __post_init__(self) -> None:
         if not self.host:
@@ -45,10 +61,23 @@ class PicoGmrMotionParams:
             raise ValueError("PICO GMR reference_yaw_mode is invalid")
         if self.backend not in {"auto", "rknn", "openvino", "onnxruntime"}:
             raise ValueError("PICO GMR backend is invalid")
+        for name, value in (
+            ("head_pitch_limit_rad", self.head_pitch_limit_rad),
+            ("head_yaw_limit_rad", self.head_yaw_limit_rad),
+            ("head_pitch_speed_rad_s", self.head_pitch_speed_rad_s),
+            ("head_yaw_speed_rad_s", self.head_yaw_speed_rad_s),
+        ):
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"PICO GMR {name} must be positive and finite")
+        if not math.isfinite(self.head_deadband_rad) or self.head_deadband_rad < 0.0:
+            raise ValueError("PICO GMR head_deadband_rad must be finite and non-negative")
 
 
 class PicoGmrMotionState(RobotControlState, EntryFrameProvider, RunningFrameProvider):
     """Keep RGMT balancing and consume live PICO references only while fresh."""
+
+    HEAD_KP = 16.747
+    HEAD_KD = 1.066
 
     def __init__(
         self,
@@ -73,6 +102,10 @@ class PicoGmrMotionState(RobotControlState, EntryFrameProvider, RunningFrameProv
         self._fallback_quat_wxyz = np.zeros((21, 4), dtype=np.float32)
         self._fallback_lin_vel_w = np.zeros((21, 3), dtype=np.float32)
         self._fallback_ang_vel_w = np.zeros((21, 3), dtype=np.float32)
+        self._hold_command = JointTargetBuffer(ELF3_ISAAC_JOINTS)
+        self._head_command = JointTargetBuffer(PICO_HEAD_JOINTS)
+        self._policy_composer: JointCommandComposer | None = None
+        self._hold_composer: JointCommandComposer | None = None
 
     @property
     def policy(self) -> RgmtExternalReferencePolicy:
@@ -103,15 +136,72 @@ class PicoGmrMotionState(RobotControlState, EntryFrameProvider, RunningFrameProv
         self._fallback_joint_pos[...] = self.policy.output.joints.position
         self._align_fallback_orientation(ctx)
 
-    def _hold_frame(self, ctx: RobotControlContext) -> MotorFrame:
-        target = self.policy.output.joints
-        return self._motor_frame(
-            ctx,
+    def _prepare_command_sources(self) -> None:
+        policy_target = self.policy.output.joints
+        self._hold_command.update(
             self._hold_position,
-            target.kp,
-            target.kd,
-            layout=ELF3_ISAAC_JOINTS,
+            policy_target.kp,
+            policy_target.kd,
         )
+        self._head_command.position.fill(0.0)
+        self._head_command.kp.fill(self.HEAD_KP)
+        self._head_command.kd.fill(self.HEAD_KD)
+        self._policy_composer = JointCommandComposer(
+            PICO_GMR_OUTPUT_JOINTS,
+            (
+                JointCommandLayer("rgmt_policy", policy_target),
+                JointCommandLayer("pico_head", self._head_command.view),
+            ),
+        )
+        self._hold_composer = JointCommandComposer(
+            PICO_GMR_OUTPUT_JOINTS,
+            (
+                JointCommandLayer("entry_hold", self._hold_command.view),
+                JointCommandLayer("pico_head", self._head_command.view),
+            ),
+        )
+
+    def _update_head_command(
+        self,
+        desired: object,
+        dt: float,
+        *,
+        advance: bool,
+    ) -> None:
+        if not advance:
+            return
+        target = np.asarray(desired, dtype=np.float32)
+        if target.shape != (2,) or not np.isfinite(target).all():
+            raise ValueError("PICO head target must contain two finite joint angles")
+        target = np.clip(
+            target,
+            (-self.params.head_pitch_limit_rad, -self.params.head_yaw_limit_rad),
+            (self.params.head_pitch_limit_rad, self.params.head_yaw_limit_rad),
+        )
+        target[np.abs(target) < self.params.head_deadband_rad] = 0.0
+        max_step = np.asarray(
+            (
+                self.params.head_pitch_speed_rad_s * dt,
+                self.params.head_yaw_speed_rad_s * dt,
+            ),
+            dtype=np.float32,
+        )
+        delta = np.clip(
+            target - self._head_command.position,
+            -max_step,
+            max_step,
+        )
+        self._head_command.position += delta
+
+    def _compose_policy_frame(self) -> MotorFrame:
+        if self._policy_composer is None:
+            raise RuntimeError("PICO GMR policy command composer is not prepared")
+        return self._policy_composer.compose()
+
+    def _hold_frame(self) -> MotorFrame:
+        if self._hold_composer is None:
+            raise RuntimeError("PICO GMR hold command composer is not prepared")
+        return self._hold_composer.compose()
 
     def on_prepare(
         self,
@@ -122,6 +212,7 @@ class PicoGmrMotionState(RobotControlState, EntryFrameProvider, RunningFrameProv
         self.policy.reset(ctx.inference_frame)
         self._capture_hold(ctx)
         self._prepare_fallback(ctx)
+        self._prepare_command_sources()
         self._last_session_id = None
         self._last_sequence = None
         self._has_inferred = False
@@ -133,7 +224,7 @@ class PicoGmrMotionState(RobotControlState, EntryFrameProvider, RunningFrameProv
         )
 
     def get_entry_frame(self, ctx: RobotControlContext) -> MotorFrame:
-        return self._hold_frame(ctx)
+        return self._hold_frame()
 
     def _is_new(self, window: ReferenceWindow) -> bool:
         return (
@@ -182,7 +273,7 @@ class PicoGmrMotionState(RobotControlState, EntryFrameProvider, RunningFrameProv
                 session_id=None,
                 advance=advance,
             )
-            output = self.policy.step_with_reference_window(
+            self.policy.step_with_reference_window(
                 ctx.inference_frame,
                 dt,
                 reference_joint_pos_window=self._fallback_joint_pos,
@@ -194,18 +285,24 @@ class PicoGmrMotionState(RobotControlState, EntryFrameProvider, RunningFrameProv
             )
             if advance:
                 self._has_inferred = True
-            return self._motor_frame_from_target(ctx, output.joints)
+            self._update_head_command((0.0, 0.0), dt, advance=advance)
+            return self._compose_policy_frame()
         self._select_reference_source(
             ctx,
             "live",
             session_id=window.session_id,
             advance=advance,
         )
+        self._update_head_command(
+            window.head_joint_pos[-1],
+            dt,
+            advance=advance,
+        )
         if not self._is_new(window):
             if self._has_inferred:
-                return self._motor_frame_from_target(ctx, self.policy.output.joints)
-            return self._hold_frame(ctx)
-        output = self.policy.step_with_reference_window(
+                return self._compose_policy_frame()
+            return self._hold_frame()
+        self.policy.step_with_reference_window(
             ctx.inference_frame,
             dt,
             reference_joint_pos_window=window.joint_pos,
@@ -219,7 +316,7 @@ class PicoGmrMotionState(RobotControlState, EntryFrameProvider, RunningFrameProv
             self._last_session_id = window.session_id
             self._last_sequence = window.latest_sequence
             self._has_inferred = True
-        return self._motor_frame_from_target(ctx, output.joints)
+        return self._compose_policy_frame()
 
     def on_update(self, ctx: RobotControlContext, dt: float) -> None:
         previous_source = self._reference_source
@@ -233,4 +330,9 @@ class PicoGmrMotionState(RobotControlState, EntryFrameProvider, RunningFrameProv
             self.logger.info("实时参考未启用或已断流，继续使用RGMT站立平衡参考")
 
 
-__all__ = ["PicoGmrMotionParams", "PicoGmrMotionState"]
+__all__ = [
+    "PICO_GMR_OUTPUT_JOINTS",
+    "PICO_HEAD_JOINTS",
+    "PicoGmrMotionParams",
+    "PicoGmrMotionState",
+]

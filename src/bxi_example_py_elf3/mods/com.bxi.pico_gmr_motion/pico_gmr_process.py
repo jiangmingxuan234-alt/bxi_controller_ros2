@@ -23,6 +23,7 @@ from gmr import (
     quaternion_rotation_vector_wxyz,
     unity_pose_to_right_handed,
 )
+from head_tracking import HEAD_JOINT_NAMES, PicoHeadMapper
 from protocol import (
     LiveReferenceFrame,
     REFERENCE_JOINT_NAMES,
@@ -130,10 +131,11 @@ def _capture_diagnostic_frame(
     path: Path,
     human_data: dict[str, tuple[np.ndarray, np.ndarray]],
     joints: np.ndarray,
+    head_joints: np.ndarray,
     source_ns: int,
 ) -> None:
     payload = {
-        "format": "bxi_pico_gmr_frame_v1",
+        "format": "bxi_pico_gmr_frame_v2",
         "coordinate_system": "mocaplab_unity_to_right_handed",
         "source_timestamp_ns": int(source_ns),
         "human_data": {
@@ -145,6 +147,8 @@ def _capture_diagnostic_frame(
         },
         "gmr_joint_names": list(REFERENCE_JOINT_NAMES),
         "gmr_joint_pos": np.asarray(joints, dtype=float).tolist(),
+        "head_joint_names": list(HEAD_JOINT_NAMES),
+        "head_joint_pos": np.asarray(head_joints, dtype=float).tolist(),
     }
     destination = path.expanduser().resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -215,6 +219,7 @@ def _run_reference_loop(
     stop_event: Event,
     tracking_gate: TrackingGate,
     retargeter: PicoGmrRetargeter,
+    head_mapper: PicoHeadMapper,
     udp: socket.socket,
     destination: tuple[str, int],
     rate_hz: float,
@@ -249,6 +254,7 @@ def _run_reference_loop(
             invalid_frames = 0
             static_timestamp_frames = 0
             retargeter.reset()
+            head_mapper.reset()
             was_enabled = True
         try:
             body_frame = _read_body_frame()
@@ -272,11 +278,16 @@ def _run_reference_loop(
                 human_data,
                 dt=period,
             )
+            head_joints = head_mapper.update(
+                human_data["Spine3"][1],
+                human_data["Head"][1],
+            )
             if capture_frame is not None and not capture_written:
                 _capture_diagnostic_frame(
                     capture_frame,
                     human_data,
                     joints,
+                    head_joints,
                     source_ns,
                 )
                 print(f"Captured converted PICO frame: {capture_frame.resolve()}", flush=True)
@@ -294,6 +305,7 @@ def _run_reference_loop(
                 sequence=sequence,
                 source_timestamp_ns=source_ns,
                 joint_pos=joints,
+                head_joint_pos=head_joints,
                 anchor_quat_wxyz=root_quaternion,
                 anchor_lin_vel_w=linear_velocity,
                 anchor_ang_vel_w=angular_velocity,
@@ -306,7 +318,8 @@ def _run_reference_loop(
                     f"PICO GMR stream active: {len(REFERENCE_JOINT_NAMES)} joints, "
                     f"{rate_hz:.1f} Hz -> udp://{destination[0]}:{destination[1]}; "
                     f"first elbows: left={np.degrees(left_elbow):.2f} deg, "
-                    f"right={np.degrees(right_elbow):.2f} deg"
+                    f"right={np.degrees(right_elbow):.2f} deg; "
+                    "head centered at pitch=0.00 deg, yaw=0.00 deg"
                 )
             if sequence + 1 == REFERENCE_WINDOW_SIZE:
                 print(
@@ -364,6 +377,7 @@ def main() -> int:
     service = ManagedRoboticsService()
     xrt_session = XrtBackgroundSession(xrt)
     tracking_gate = TrackingGate()
+    head_mapper = PicoHeadMapper()
     workers: list[Thread] = []
     exit_code = 0
     try:
@@ -393,6 +407,7 @@ def main() -> int:
                 "stop_event": stop_event,
                 "tracking_gate": tracking_gate,
                 "retargeter": retargeter,
+                "head_mapper": head_mapper,
                 "udp": udp,
                 "destination": destination,
                 "rate_hz": args.rate_hz,
