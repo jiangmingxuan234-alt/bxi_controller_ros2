@@ -44,8 +44,61 @@ def _build_state(
         gripper_left_bus=state.int_param("gripper_left_bus", 5),
         gripper_right_bus=state.int_param("gripper_right_bus", 6),
         gripper_can_id=state.int_param("gripper_can_id", 1),
+        gripper_master_id=state.int_param("gripper_master_id", 0x11),
         gripper_kp=state.float_param("gripper_kp", 20.0),
         gripper_kd=state.float_param("gripper_kd", 1.0),
+        gripper_calibration_speed_rad_s=state.float_param(
+            "gripper_calibration_speed_rad_s",
+            0.2,
+        ),
+        gripper_calibration_kp=state.float_param("gripper_calibration_kp", 5.0),
+        gripper_calibration_kd=state.float_param("gripper_calibration_kd", 0.5),
+        gripper_contact_torque=state.float_param("gripper_contact_torque", 2.0),
+        gripper_abort_torque=state.float_param("gripper_abort_torque", 8.0),
+        gripper_contact_confirm_s=state.float_param(
+            "gripper_contact_confirm_s",
+            0.25,
+        ),
+        gripper_stopped_velocity_rad_s=state.float_param(
+            "gripper_stopped_velocity_rad_s",
+            0.1,
+        ),
+        gripper_tracking_error_rad=state.float_param(
+            "gripper_tracking_error_rad",
+            0.08,
+        ),
+        gripper_limit_margin_rad=state.float_param(
+            "gripper_limit_margin_rad",
+            0.15,
+        ),
+        gripper_minimum_span_rad=state.float_param(
+            "gripper_minimum_span_rad",
+            1.0,
+        ),
+        gripper_maximum_search_travel_rad=state.float_param(
+            "gripper_maximum_search_travel_rad",
+            7.0,
+        ),
+        gripper_response_timeout_s=state.float_param(
+            "gripper_response_timeout_s",
+            1.0,
+        ),
+        gripper_feedback_timeout_s=state.float_param(
+            "gripper_feedback_timeout_s",
+            0.3,
+        ),
+        gripper_phase_timeout_s=state.float_param(
+            "gripper_phase_timeout_s",
+            45.0,
+        ),
+        gripper_maximum_mos_temperature_c=state.int_param(
+            "gripper_maximum_mos_temperature_c",
+            80,
+        ),
+        gripper_maximum_motor_temperature_c=state.int_param(
+            "gripper_maximum_motor_temperature_c",
+            80,
+        ),
     )
 
 

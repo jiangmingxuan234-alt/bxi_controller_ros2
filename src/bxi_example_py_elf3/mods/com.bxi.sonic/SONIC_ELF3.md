@@ -241,12 +241,31 @@ live 数据超过 `live_reference_timeout_s` 后会丢弃陈旧包，并平滑�
 | `gripper_left_bus` | `5` | 左夹爪 CAN 总线 |
 | `gripper_right_bus` | `6` | 右夹爪 CAN 总线 |
 | `gripper_can_id` | `1` | 夹爪电机 CAN ID |
-| `gripper_kp` | `20.0` | 夹爪位置环 KP |
-| `gripper_kd` | `1.0` | 夹爪位置环 KD |
+| `gripper_master_id` | `17` | 夹爪响应帧仲裁 ID |
+| `gripper_kp` | `10.0` | 校准完成后的夹爪位置环 KP |
+| `gripper_kd` | `0.5` | 校准完成后的夹爪位置环 KD |
+| `gripper_calibration_speed_rad_s` | `0.2` | 每次进入状态时寻找限位的低速角度斜坡 |
+| `gripper_calibration_kp` | `5.0` | 校准低位置增益 |
+| `gripper_calibration_kd` | `0.5` | 校准速度增益 |
+| `gripper_contact_torque` | `2.0` | 机械限位接触力矩阈值 |
+| `gripper_abort_torque` | `8.0` | 校准立即中止力矩阈值 |
+| `gripper_contact_confirm_s` | `0.25` | 限位条件连续确认时间 |
+| `gripper_stopped_velocity_rad_s` | `0.1` | 接触时最大实测速度 |
+| `gripper_tracking_error_rad` | `0.08` | 接触/回退判定角度误差 |
+| `gripper_limit_margin_rad` | `0.15` | 从机械限位向内回退距离 |
+| `gripper_minimum_span_rad` | `1.0` | 最小合法软限位行程 |
+| `gripper_maximum_search_travel_rad` | `7.0` | 单方向最大校准行程 |
+| `gripper_response_timeout_s` | `1.0` | 首个响应帧超时，超时即认为电机离线 |
+| `gripper_feedback_timeout_s` | `0.3` | 运行中响应帧断流超时 |
+| `gripper_phase_timeout_s` | `45.0` | 单个校准阶段超时 |
+| `gripper_maximum_mos_temperature_c` | `80` | 驱动 MOS 温度上限 |
+| `gripper_maximum_motor_temperature_c` | `80` | 电机线圈温度上限 |
 
-硬件运行前必须在目标机器人上确认左右总线号、方向、行程和增益。进入状态时立即对两侧
-发送 `enter_motor_mode` 和默认打开位置，之后按 `gripper_enable_interval_s` 周期重新发送
-使能。trigger 未发布或断流时继续使用最近值；初始值为完全松开，即夹爪打开。
+硬件运行前必须在目标机器人上确认左右总线号、方向、力矩阈值和增益。每次进入状态时
+立即对两侧发送 `enter_motor_mode`，订阅 `/canfd_packet/rx`，然后依次执行“寻找张开限位、
+回退、寻找闭合限位、回退、返回张开位置”。没有合法响应帧即认为对应电机离线；任一侧
+失败时左右夹爪都退出电机模式。校准完成前 trigger 不接管夹爪，完成后按各侧实测软限位
+映射 trigger。
 
 ## 内部端口和诊断
 

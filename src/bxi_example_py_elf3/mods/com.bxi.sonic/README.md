@@ -360,8 +360,41 @@ SONIC 对外只保留部署环境相关变量：
 | `gripper_left_bus` | `5` | 左夹爪 CAN 总线号 |
 | `gripper_right_bus` | `6` | 右夹爪 CAN 总线号 |
 | `gripper_can_id` | `1` | 两侧夹爪电机 CAN ID |
+| `gripper_master_id` | `17` | 电机响应帧仲裁 ID，默认 `can_id | 0x10` |
 | `gripper_kp` | `20.0` | 夹爪位置环 KP |
 | `gripper_kd` | `1.0` | 夹爪位置环 KD |
+| `gripper_calibration_speed_rad_s` | `0.2` | 每次进入状态时寻找机械限位的目标角度速度 |
+| `gripper_calibration_kp` | `5.0` | 限位校准期间使用的低位置增益 |
+| `gripper_calibration_kd` | `0.5` | 限位校准期间使用的速度增益 |
+| `gripper_contact_torque` | `2.0` | 持续达到该反馈力矩后判定接触限位 |
+| `gripper_abort_torque` | `8.0` | 达到该反馈力矩立即中止校准并退出电机模式 |
+| `gripper_contact_confirm_s` | `0.25` | 力矩、低速和跟踪误差同时成立的确认时间 |
+| `gripper_stopped_velocity_rad_s` | `0.1` | 限位接触判定的最大实测速度 |
+| `gripper_tracking_error_rad` | `0.08` | 限位接触判定和回退稳定判定的角度误差 |
+| `gripper_limit_margin_rad` | `0.15` | 从两侧机械硬限位向内回退的软限位距离 |
+| `gripper_minimum_span_rad` | `1.0` | 合法软开闭位置之间的最小行程 |
+| `gripper_maximum_search_travel_rad` | `7.0` | 单方向校准允许的最大实测行程 |
+| `gripper_response_timeout_s` | `1.0` | 进入状态后等待首个合法响应帧的时间 |
+| `gripper_feedback_timeout_s` | `0.3` | 校准期间允许响应帧中断的最长时间 |
+| `gripper_phase_timeout_s` | `45.0` | 单个限位搜索或返回阶段的最长时间 |
+| `gripper_maximum_mos_temperature_c` | `80` | 驱动 MOS 温度上限 |
+| `gripper_maximum_motor_temperature_c` | `80` | 电机线圈温度上限 |
+
+### 夹爪响应与自动校准
+
+启用硬件夹爪后，状态发布 `/canfd_packet/tx` 并订阅
+`/canfd_packet/rx`。合法响应必须同时匹配左右总线号、`gripper_master_id`、8 字节
+载荷以及载荷首字节中的 `gripper_can_id`。位置、速度和力矩分别按 16、12、12 位
+MIT 线性范围解码，最后两个字节作为 MOS 和电机温度。
+
+每次进入 `sonic_teleop` 都会重新执行完整校准：等待两侧新鲜响应、低速寻找张开硬
+限位、向内回退、低速寻找闭合硬限位、再次回退，最后低速返回张开软限位。限位必须
+同时满足滤波力矩、低实测速度、目标跟踪误差和持续时间条件。校准完成前忽略 trigger
+夹爪目标；完成后将 trigger 映射到各侧独立测得的软开闭位置。
+
+任一侧没有首帧、反馈中途超时、超过最大行程/阶段时间、力矩达到中止阈值或温度
+超限，都会判定本次夹爪校准失败，并让左右夹爪一起退出电机模式。机器人本体的
+SONIC 策略仍保持运行，错误会在状态日志中明确报告。
 
 bridge 始终发布 `pico/left_trigger`、`pico/right_trigger`、`pico/left_grip` 和
 `pico/right_grip`。是否真正向夹爪发送 CAN 命令只由 `mod.yaml` 中的
