@@ -214,6 +214,29 @@ class GripperCalibrator:
             and abs(feedback.velocity) <= self.settings.stopped_velocity_rad_s
         )
 
+    def _backoff_complete(self, feedback: MotorFeedback, now: float) -> bool:
+        """Accept safe-direction overshoot while backing away from a hard stop."""
+
+        assert self.target_position is not None
+        if (
+            now - self._phase_started_at < self.settings.settle_time_s
+            or abs(feedback.velocity) > self.settings.stopped_velocity_rad_s
+        ):
+            return False
+        tolerance = self.settings.tracking_error_rad
+        if self.phase is CalibrationPhase.BACKING_OFF_OPEN:
+            return feedback.position <= self.target_position + tolerance
+        if self.phase is CalibrationPhase.BACKING_OFF_CLOSED:
+            return feedback.position >= self.target_position - tolerance
+        raise RuntimeError(
+            f"backoff completion checked in invalid phase {self.phase.value}"
+        )
+
+    def _check_backoff_timeout(self, now: float) -> bool:
+        if now - self._phase_started_at >= self.settings.phase_timeout_s:
+            self.fail(f"{self.label} gripper backoff phase timed out")
+        return self.failed
+
     def _check_common_faults(
         self,
         feedback: Optional[MotorFeedback],
@@ -304,8 +327,10 @@ class GripperCalibrator:
             return self.target_position
 
         if self.phase is CalibrationPhase.BACKING_OFF_OPEN:
-            if self._settled(feedback, now):
+            if self._backoff_complete(feedback, now):
                 self._set_phase(CalibrationPhase.SEEKING_CLOSED, now, feedback)
+            else:
+                self._check_backoff_timeout(now)
             return self.target_position
 
         if self.phase is CalibrationPhase.SEEKING_CLOSED:
@@ -330,8 +355,10 @@ class GripperCalibrator:
             return self.target_position
 
         if self.phase is CalibrationPhase.BACKING_OFF_CLOSED:
-            if self._settled(feedback, now):
+            if self._backoff_complete(feedback, now):
                 self._set_phase(CalibrationPhase.RETURNING_OPEN, now, feedback)
+            else:
+                self._check_backoff_timeout(now)
             return self.target_position
 
         if self.phase is CalibrationPhase.RETURNING_OPEN:
