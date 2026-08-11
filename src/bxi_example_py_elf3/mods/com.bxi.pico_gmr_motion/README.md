@@ -90,6 +90,11 @@ retargeted output.
 
 ## PICO 头部跟踪
 
+是否由该状态控制机器人头部由
+`states.pico_gmr_motion.params.head_control_enabled` 决定，默认为 `true`。设为
+`false` 后状态只输出 RGMT policy 的 29 个身体关节，不声明
+`head_y_joint/head_z_joint` 的命令所有权；头部将由机器人平台默认命令或其他命令来源处理。
+
 实时跟踪打开后，Mod 还会读取 XRoboToolkit body tracking 中的 `Spine3` 和
 `Head` 四元数。头部命令不使用世界绝对姿态，而是先计算：
 
@@ -166,19 +171,21 @@ rtsp://<机器人IP>:2212/video
 
 ### 支持的环境与运行依赖
 
-当前随 Mod 构建的 x86_64 推流器针对以下环境验证：
+当前随 Mod 构建的推流器分别针对以下环境验证：
 
-- Ubuntu 22.04；
-- ROS 2 Humble；
-- GCC 11，C++17；
-- FFmpeg 4.4 ABI：`libavcodec.so.58`、`libavformat.so.58`、
-  `libavutil.so.56`、`libswscale.so.5`；
+- x86_64：Ubuntu 22.04、ROS 2 Humble、GCC 11、FFmpeg 4.4 ABI
+  (`libavcodec.so.58`、`libavformat.so.58`、`libavutil.so.56`、
+  `libswscale.so.5`)；
+- aarch64：Ubuntu 22.04、ROS 2 Humble、GCC 11、FFmpeg 6.0 ABI
+  (`libavcodec.so.60`、`libavformat.so.60`、`libavutil.so.58`、
+  `libswscale.so.7`)；
+- 两个平台均使用 C++17；
 - MediaMTX 1.15.6；
 - `libx264` H.264 encoder。
 
 推流器动态链接目标机器的 ROS 和 FFmpeg 系统库。若目标机器库的 SONAME/ABI 与
-上述不同，必须在目标机器重新运行构建工具，不能直接复制 x86_64 可执行文件。
-aarch64 没有使用 x86_64 产物的 fallback，必须在 aarch64 目标机安装依赖并本机构建。
+对应平台的上述基线不同，必须在目标机器重新运行构建工具，不能跨架构或跨 FFmpeg ABI
+复用可执行文件。Mod 已同时携带 x86_64 和 aarch64 产物，框架只会选择当前平台目录。
 
 Ubuntu 22.04 / ROS Humble 安装完整编译和运行依赖：
 
@@ -298,6 +305,10 @@ readelf -d \
   src/bxi_example_py_elf3/mods/com.bxi.pico_gmr_motion/bin/linux-x86_64/head_camera_rtsp_node \
   | grep -E 'RPATH|RUNPATH' || true
 ```
+
+在 ARM64 机器上把目录替换为 `bin/linux-aarch64`。随 Mod 提供的 ARM64 产物已经在
+RK3588 上完成进程级冒烟测试：节点可以初始化 ROS、订阅两个相机话题、输出统计并响应
+SIGINT；实际相机编码链路仍应在目标机器部署后验证。
 
 ### 参数与排障
 

@@ -11,13 +11,21 @@ from rclpy.qos import QoSProfile
 from std_msgs.msg import Float32
 
 from bxi_example_py_elf3.framework.inference import InferenceFrame, PolicyOutput
-from bxi_example_py_elf3.framework.mod_api import ResourceHandle, RobotControlState
-from bxi_example_py_elf3.framework.mod_api import StateBehavior
+from bxi_example_py_elf3.framework.mod_api import (
+    JointCommandComposer,
+    JointCommandLayer,
+    JointLayout,
+    JointTargetBuffer,
+    ResourceHandle,
+    RobotControlState,
+    StateBehavior,
+)
 from bxi_example_py_elf3.framework.mod_api.transition import (
     EntryFrameProvider,
     MotorFrame,
     RunningFrameProvider,
 )
+from bxi_example_py_elf3.policies.joints import ELF3_POLICY_JOINTS
 
 from .gripper import (
     BxiMotor,
@@ -32,9 +40,18 @@ if TYPE_CHECKING:
     from bxi_example_py_elf3.framework.mod_api import LoggerLike, RobotControlContext
 
 
+HEAD_JOINT_NAMES = ("head_y_joint", "head_z_joint")
+SONIC_HEAD_JOINTS = JointLayout(HEAD_JOINT_NAMES, label="SONIC PICO head command")
+SONIC_OUTPUT_JOINTS = JointLayout(
+    (*ELF3_POLICY_JOINTS.names, *SONIC_HEAD_JOINTS.names),
+    label="SONIC state output",
+)
+
+
 class SonicPolicy(Protocol):
     output: PolicyOutput
     last_status: str
+    head_joint_target: np.ndarray
 
     def bind_logger(self, logger: LoggerLike) -> None:
         ...
@@ -73,7 +90,10 @@ class SonicTeleopState(
     EntryFrameProvider,
     RunningFrameProvider,
 ):
-    """Named-joint SONIC policy state with optional PICO gripper control."""
+    """Named-joint SONIC policy state with PICO head and optional gripper control."""
+
+    HEAD_KP = 16.747
+    HEAD_KD = 1.066
 
     def __init__(
         self,
@@ -86,6 +106,12 @@ class SonicTeleopState(
         live_reference_timeout_s: float = 0.5,
         idle_frame_start: int = 3509,
         source_blend_seconds: float = 0.4,
+        head_control_enabled: bool = True,
+        head_pitch_limit_rad: float = 0.5,
+        head_yaw_limit_rad: float = 1.0,
+        head_pitch_speed_rad_s: float = 1.5,
+        head_yaw_speed_rad_s: float = 2.0,
+        head_deadband_rad: float = 0.015,
         hardware_gripper: bool = False,
         gripper_enable_interval_s: float = 1.0,
         gripper_left_bus: int = 5,
@@ -120,6 +146,12 @@ class SonicTeleopState(
         self.live_reference_timeout_s = float(live_reference_timeout_s)
         self.idle_frame_start = int(idle_frame_start)
         self.source_blend_seconds = float(source_blend_seconds)
+        self.head_control_enabled = bool(head_control_enabled)
+        self.head_pitch_limit_rad = float(head_pitch_limit_rad)
+        self.head_yaw_limit_rad = float(head_yaw_limit_rad)
+        self.head_pitch_speed_rad_s = float(head_pitch_speed_rad_s)
+        self.head_yaw_speed_rad_s = float(head_yaw_speed_rad_s)
+        self.head_deadband_rad = float(head_deadband_rad)
         self.hardware_gripper = bool(hardware_gripper)
         self.gripper_enable_interval_s = float(gripper_enable_interval_s)
         self._left_bus = int(gripper_left_bus)
@@ -153,6 +185,8 @@ class SonicTeleopState(
         self._validate_config()
         self._last_running_frame: Optional[MotorFrame] = None
         self._policy_logger_bound = False
+        self._head_command = JointTargetBuffer(SONIC_HEAD_JOINTS)
+        self._command_composer: JointCommandComposer | None = None
 
         self._gripper_session_active = False
         self._gripper_armed = False
@@ -248,6 +282,11 @@ class SonicTeleopState(
             self.yaw_bias_rad,
             self.live_reference_timeout_s,
             self.source_blend_seconds,
+            self.head_pitch_limit_rad,
+            self.head_yaw_limit_rad,
+            self.head_pitch_speed_rad_s,
+            self.head_yaw_speed_rad_s,
+            self.head_deadband_rad,
             self.gripper_enable_interval_s,
             self._gripper_kp,
             self._gripper_kd,
@@ -262,6 +301,15 @@ class SonicTeleopState(
             raise ValueError("idle_frame_start must be non-negative")
         if self.source_blend_seconds < 0.0:
             raise ValueError("source_blend_seconds must be non-negative")
+        if min(
+            self.head_pitch_limit_rad,
+            self.head_yaw_limit_rad,
+            self.head_pitch_speed_rad_s,
+            self.head_yaw_speed_rad_s,
+        ) <= 0.0:
+            raise ValueError("SONIC head limits and speeds must be positive")
+        if self.head_deadband_rad < 0.0:
+            raise ValueError("SONIC head_deadband_rad must be non-negative")
         if (
             min(
                 self._gripper_kp,
@@ -297,11 +345,61 @@ class SonicTeleopState(
             source_blend_duration_s=self.source_blend_seconds,
         )
         self.policy.reset(ctx.inference_frame)
+        self._prepare_command_source()
         self._last_running_frame = None
         self._gripper_session_active = False
 
+    def _prepare_command_source(self) -> None:
+        self._head_command.position.fill(0.0)
+        self._head_command.kp.fill(self.HEAD_KP)
+        self._head_command.kd.fill(self.HEAD_KD)
+        if not self.head_control_enabled:
+            self._command_composer = JointCommandComposer(
+                ELF3_POLICY_JOINTS,
+                (JointCommandLayer("sonic_policy", self.policy.output.joints),),
+            )
+            return
+        self._command_composer = JointCommandComposer(
+            SONIC_OUTPUT_JOINTS,
+            (
+                JointCommandLayer("sonic_policy", self.policy.output.joints),
+                JointCommandLayer("pico_head", self._head_command.view),
+            ),
+        )
+
     def get_entry_frame(self, ctx: RobotControlContext) -> MotorFrame:
-        return self._motor_frame_from_target(ctx, self.policy.output.joints)
+        return self._compose_motor_frame()
+
+    def _update_head_command(self, desired: object, dt: float) -> None:
+        if not self.head_control_enabled:
+            return
+        target = np.asarray(desired, dtype=np.float32)
+        if target.shape != (2,) or not np.isfinite(target).all():
+            raise ValueError("SONIC head target must contain two finite joint angles")
+        target = np.clip(
+            target,
+            (-self.head_pitch_limit_rad, -self.head_yaw_limit_rad),
+            (self.head_pitch_limit_rad, self.head_yaw_limit_rad),
+        )
+        target[np.abs(target) < self.head_deadband_rad] = 0.0
+        max_step = np.asarray(
+            (
+                self.head_pitch_speed_rad_s * dt,
+                self.head_yaw_speed_rad_s * dt,
+            ),
+            dtype=np.float32,
+        )
+        delta = np.clip(
+            target - self._head_command.position,
+            -max_step,
+            max_step,
+        )
+        self._head_command.position += delta
+
+    def _compose_motor_frame(self) -> MotorFrame:
+        if self._command_composer is None:
+            raise RuntimeError("SONIC command composer is not prepared")
+        return self._command_composer.compose()
 
     def sample_running_frame(
         self,
@@ -312,14 +410,23 @@ class SonicTeleopState(
     ) -> MotorFrame:
         if not advance:
             return self._last_running_frame or self.get_entry_frame(ctx)
-        output = self.policy.step(ctx.inference_frame, dt, advance=True)
-        frame = self._motor_frame_from_target(ctx, output.joints)
+        self.policy.step(ctx.inference_frame, dt, advance=True)
+        self._update_head_command(self.policy.head_joint_target, dt)
+        frame = self._compose_motor_frame()
         self._last_running_frame = frame
         return frame
 
     def on_enter(self, ctx: RobotControlContext) -> None:
         mode = "SONIC遥操（夹爪）" if self.hardware_gripper else "SONIC遥操"
-        self.logger.info(f"{mode}已启动；PICO同时按住A+B+X+Y请求校准，再按A+X切入实时POSE")
+        head_status = (
+            "头部跟踪已开启"
+            if self.head_control_enabled
+            else "头部跟踪已关闭"
+        )
+        self.logger.info(
+            f"{mode}已启动；{head_status}；"
+            "PICO同时按住A+B+X+Y请求校准，再按A+X切入实时POSE"
+        )
         if self.hardware_gripper:
             self._left_trigger = self._right_trigger = 0.0
             now = time.monotonic()
@@ -583,4 +690,9 @@ class SonicTeleopState(
         self._publish_gripper(self._right_bus, self._right_trigger)
 
 
-__all__ = ["SonicTeleopState"]
+__all__ = [
+    "HEAD_JOINT_NAMES",
+    "SONIC_HEAD_JOINTS",
+    "SONIC_OUTPUT_JOINTS",
+    "SonicTeleopState",
+]

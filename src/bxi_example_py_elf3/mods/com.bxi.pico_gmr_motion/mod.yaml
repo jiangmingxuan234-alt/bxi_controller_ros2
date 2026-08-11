@@ -1,7 +1,7 @@
 schema: 1
 id: com.bxi.pico_gmr_motion
 name: PICO GMR任意动作
-version: 1.0.0
+version: 1.1.0
 api: ">=4,<5"
 enable: true
 entrypoint: plugin:create_mod
@@ -154,6 +154,7 @@ states:
       stale_timeout_s: 0.4
       reference_yaw_mode: initial
       backend: auto
+      head_control_enabled: false
       head_pitch_limit_rad: 0.5
       head_yaw_limit_rad: 1.0
       head_pitch_speed_rad_s: 1.5

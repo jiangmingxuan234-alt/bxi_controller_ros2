@@ -44,6 +44,7 @@ class PicoGmrMotionParams:
     stale_timeout_s: float = 0.4
     reference_yaw_mode: str = "initial"
     backend: str = "auto"
+    head_control_enabled: bool = True
     head_pitch_limit_rad: float = 0.5
     head_yaw_limit_rad: float = 1.0
     head_pitch_speed_rad_s: float = 1.5
@@ -146,6 +147,16 @@ class PicoGmrMotionState(RobotControlState, EntryFrameProvider, RunningFrameProv
         self._head_command.position.fill(0.0)
         self._head_command.kp.fill(self.HEAD_KP)
         self._head_command.kd.fill(self.HEAD_KD)
+        if not self.params.head_control_enabled:
+            self._policy_composer = JointCommandComposer(
+                ELF3_ISAAC_JOINTS,
+                (JointCommandLayer("rgmt_policy", policy_target),),
+            )
+            self._hold_composer = JointCommandComposer(
+                ELF3_ISAAC_JOINTS,
+                (JointCommandLayer("entry_hold", self._hold_command.view),),
+            )
+            return
         self._policy_composer = JointCommandComposer(
             PICO_GMR_OUTPUT_JOINTS,
             (
@@ -168,7 +179,7 @@ class PicoGmrMotionState(RobotControlState, EntryFrameProvider, RunningFrameProv
         *,
         advance: bool,
     ) -> None:
-        if not advance:
+        if not advance or not self.params.head_control_enabled:
             return
         target = np.asarray(desired, dtype=np.float32)
         if target.shape != (2,) or not np.isfinite(target).all():
@@ -219,8 +230,14 @@ class PicoGmrMotionState(RobotControlState, EntryFrameProvider, RunningFrameProv
         self._reference_source = None
 
     def on_enter(self, ctx: RobotControlContext) -> None:
+        head_status = (
+            "头部跟踪已开启"
+            if self.params.head_control_enabled
+            else "头部跟踪已关闭"
+        )
         self.logger.info(
-            "PICO GMR已启动并保持RGMT站立平衡；PICO同时按A+X开始/停止实时跟踪"
+            "PICO GMR已启动并保持RGMT站立平衡；"
+            f"{head_status}；PICO同时按A+X开始/停止实时跟踪"
         )
 
     def get_entry_frame(self, ctx: RobotControlContext) -> MotorFrame:

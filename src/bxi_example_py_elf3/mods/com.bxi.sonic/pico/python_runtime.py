@@ -320,6 +320,7 @@ def reexec_if_needed(component: str, imports: Sequence[str]) -> None:
         str(selected.executable),
         (
             str(selected.executable),
+            "-u",
             "-B",
             "-E",
             "-s",

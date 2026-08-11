@@ -1,7 +1,8 @@
 # SONIC 遥操 Mod
 
 Mod 负责一个参数化控制状态、SONIC 模型推理、PICO 数据接入、POSE 到 SMPL reference 的
-转换以及可选夹爪命令；MuJoCo、机器人平台 I/O 和主控制器仍由宿主负责。
+转换、头部相机 RTSP 图传以及可选夹爪命令；MuJoCo、机器人平台 I/O 和主控制器仍由宿主
+负责。
 
 目录按框架 Mod 约定分工：
 
@@ -9,7 +10,11 @@ Mod 负责一个参数化控制状态、SONIC 模型推理、PICO 数据接入�
 assets/                 控制策略模型与参考数据
 config/                 部署时使用的静态配置模板
 pico/                   PICO manager、bridge 和协议代码
-runtime/<platform>/     可移动的 RoboticsService 应用运行时
+bin/<platform>/         ROS/FFmpeg 头部相机 RTSP 推流器
+native/rtsp_streamer/   推流器源码和 CMake 工程
+runtime/<platform>/     RoboticsService 与 MediaMTX 平台运行时
+runtime/mediamtx.yml    Mod 自有 RTSP 服务配置
+tools/                  当前平台原生推流器构建工具
 vendor/python/<target>/ 当前平台与 CPython ABI 对应的二进制扩展
 vendor/lib/<platform>/  框架可注入的厂商动态库入口
 vendor/licenses/        第三方许可证与来源记录
@@ -24,7 +29,7 @@ PICO 头显/追踪设备
   -> pico_manager（ZMQ pose）
   -> smpl_bridge（ZMQ smpl_ref）
   -> SonicTeleopPolicy
-  -> 29 个具名策略关节
+  -> 29 个具名策略关节 + 2 个具名头部关节
   -> MotorFrame
 ```
 
@@ -39,20 +44,44 @@ RKNN -> OpenVINO -> ONNX Runtime
 
 ## 状态和事件
 
-- `com.bxi.sonic/sonic_teleop`：控制机器人本体的 29 个策略关节；是否控制夹爪由
-  `hardware_gripper` 参数决定。
+- `com.bxi.sonic/sonic_teleop`：控制机器人本体的 29 个策略关节，并在进入 PICO
+  `POSE` 后控制 `head_y_joint/head_z_joint`；是否控制夹爪由 `hardware_gripper`
+  参数决定。
 - `com.bxi.sonic/activate`：默认 `btn_10=9`。
 - `com.bxi.sonic/reset_alignment`：默认 `btn_9=1`。
 
-SONIC 明确声明 ELF3 的 29 关节模型布局。框架按关节名映射到机器人布局；机器人额外
-关节由其他命令来源或显式 defaults 提供，不依赖数组位置猜测。
+SONIC 策略仍明确声明 ELF3 的 29 关节模型布局，状态再用具名命令合成器追加
+`head_y_joint/head_z_joint`。框架按关节名映射到机器人布局：31 关节机器人接收
+完整身体和头部命令，29 关节机器人会按名称忽略不存在的两个头部关节，不依赖数组
+位置猜测。
+
+## PICO 头部控制
+
+是否由 SONIC 状态控制头部由 `states.sonic_teleop.params.head_control_enabled`
+决定，默认为 `true`。设为 `false` 后 SONIC 仅输出策略的 29 个身体关节，不声明
+`head_y_joint/head_z_joint` 的命令所有权；头部由机器人平台默认命令或其他命令来源处理。
+
+头部映射与 `com.bxi.pico_gmr_motion` 保持一致：使用 `Spine3` 到 `Head` 的相对旋转，
+将相对 XYZ roll 取反后映射到 `head_y_joint`，将相对 XYZ pitch 映射到
+`head_z_joint`。每次切入 `POSE` 都以当前头显姿态为中心重新归零，因此不会把进入
+模式前的绝对朝向瞬间施加给机器人。
+
+头部目标通过 `pose.head_joint_pos -> smpl_ref.head_joint_pos` 与身体参考同步传输。默认
+俯仰/偏航限位为 `0.5/1.0 rad`，速度限制为 `1.5/2.0 rad/s`，死区为
+`0.015 rad`，PD 增益为 `kp=16.747, kd=1.066`。离开 `POSE`、引用超时或回到
+idle reference 时，头部目标置零并按速度限制平滑回中。
 
 ## 框架生命周期
 
-`mod.yaml` 把两个组件放在各自正确的运行边界：
+`mod.yaml` 把四个组件放在各自正确的运行边界：
 
 ```text
 ModNodeManager
+├── mediamtx_server
+│   └── 当前平台随包 MediaMTX，监听 RTSP 2212
+├── head_camera_rtsp
+│   └── 当前平台 ROS/FFmpeg 推流器
+│       depends_on: mediamtx_server
 ├── pico_manager
 │   └── 独立选择的 Python：pico/manager_launcher.py
 └── smpl_bridge
@@ -64,7 +93,7 @@ ModNodeManager
 中选择用户 Python 或内置回退；`smpl_bridge` 显式使用 `host_ros` profile。因此用户或
 内置的厂商 Python/SDK 路径都不会进入宿主 ROS bridge。
 
-两个节点均为 `lifecycle: state`，关联唯一的 `sonic_teleop` 状态。框架会：
+四个节点均为 `lifecycle: state`，关联唯一的 `sonic_teleop` 状态。框架会：
 
 1. 在目标状态 prepare 阶段先启动 `pico_manager`，再启动 `smpl_bridge`。
 2. 把 bridge 加入宿主 `MultiThreadedExecutor`，由 50 Hz 非阻塞 timer 排空 ZMQ 输入；
@@ -75,6 +104,41 @@ ModNodeManager
 5. manager 退出后，框架停止并标记依赖它的 bridge。
 6. 向 manager 独立进程组发送 `SIGINT`，3 秒后升级为 `SIGTERM`，5 秒后发送
    `SIGKILL`，包括清理仍存活的派生进程。
+
+## 头部相机 RTSP 图传
+
+进入 `sonic_teleop` 时，框架会同时启动 `mediamtx_server` 和
+`head_camera_rtsp`。推流器订阅：
+
+```text
+/simulation/head_depth_camera/color/image_raw
+/hardware/head_depth_camera/color/image_raw
+```
+
+默认 `source_mode=auto`：连续收到 3 帧真机图像后优先使用硬件；硬件超过 0.5 秒断流
+则自动回到仿真。输出为 424x240、H.264/YUV420P、目标 60 FPS、3 Mbps、无 B 帧，
+地址为：
+
+```text
+rtsp://<机器人IP>:2212/video
+```
+
+推流器只保留每个来源的最新帧，编码或网络变慢时丢弃旧图，避免排队累积延迟。图传节点
+故障由 Mod Node 的有限重启策略处理，不会直接切换机器人状态或写入电机命令。离开 SONIC
+时框架按依赖逆序先停止推流器，再停止 MediaMTX。
+
+MediaMTX 1.15.6 的 x86_64 与 ARM64 官方静态程序、许可证和来源校验记录均随 Mod 安装。
+ROS/FFmpeg 推流器也同时提供 x86_64 与 ARM64 产物；它动态链接目标系统的 ROS Humble、
+FFmpeg 和 x264。需要为其他 ABI 重建时执行：
+
+```bash
+source /opt/ros/humble/setup.bash
+/usr/bin/python3 -B \
+  src/bxi_example_py_elf3/mods/com.bxi.sonic/tools/build_rtsp_streamer.py
+```
+
+MediaMTX 使用 TCP 2212、UDP 8002 和 UDP 8003。PICO 从其他机器访问时必须使用机器人
+实际局域网 IP；匿名读写配置只适合可信局域网，不应直接暴露到公网。
 
 `pico_manager` 内部仍负责释放 `xrobotoolkit_sdk` 并关闭它自己创建的
 `RoboticsServiceProcess`。这是 SDK 资源所有权，不是另一套状态生命周期。
@@ -334,6 +398,7 @@ SONIC 对外只保留部署环境相关变量：
 | --- | --- | --- |
 | `SONIC_PICO_PYTHON` | 自动探测 | 可选；强制 manager 使用指定解释器 |
 | `SONIC_XRT_SERVICE_DIR` | `/opt/apps/roboticsservice`，不存在时使用当前平台内置 runtime | RoboticsService 根目录 |
+| `SONIC_MEDIAMTX_BIN` | 当前平台内置 runtime，随后尝试 `PATH` | 可选；覆盖 MediaMTX 程序路径 |
 
 算法行为和夹爪硬件配置不使用环境变量，统一写在 `mod.yaml` 的 state `params`。
 这样启动进程、状态可用性检查和 policy 使用的是同一份显式配置，启动 shell 中残留的

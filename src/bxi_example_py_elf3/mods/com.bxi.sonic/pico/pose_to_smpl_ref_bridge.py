@@ -7,6 +7,7 @@ publish the same long-lived reference contract used by ``smpl_ref_bridge.py``:
     term1_local : float32 [10,72]   SMPL joints local, flattened per frame
     root_quat   : float32 [10,4]    SMPL root quaternion, wxyz
     wrist       : float32 [10,6]    ELF3 native wrist x/y/z, left then right
+    head_joint_pos : float32 [10,2] ELF3 head pitch/yaw, centered per POSE session
 
 The bridge is intentionally only an adapter: PICO/SMPL normalization stays in
 the official PICO manager, while the downstream SONIC policy consumes the
@@ -108,6 +109,7 @@ class IncomingChunk:
     term1_local: np.ndarray
     root_quat: np.ndarray
     wrist: np.ndarray
+    head_joint_pos: np.ndarray
 
 
 @dataclass
@@ -151,7 +153,12 @@ class PicoSourceReadinessGate:
             finite = all(
                 np.asarray(fields[name]).size > 0
                 and np.isfinite(np.asarray(fields[name])).all()
-                for name in ("smpl_joints", "body_quat_w", "joint_pos")
+                for name in (
+                    "smpl_joints",
+                    "body_quat_w",
+                    "joint_pos",
+                    "head_joint_pos",
+                )
             )
         except (KeyError, TypeError, ValueError, IndexError):
             mode, calibrated, finite = -1, False, False
@@ -255,7 +262,13 @@ def _extract_wrist_frames(joint_pos: np.ndarray) -> np.ndarray:
 def _parse_incoming_chunk(fields: dict[str, np.ndarray]) -> IncomingChunk:
     missing = [
         k
-        for k in ("frame_index", "smpl_joints", "body_quat_w", "joint_pos")
+        for k in (
+            "frame_index",
+            "smpl_joints",
+            "body_quat_w",
+            "joint_pos",
+            "head_joint_pos",
+        )
         if k not in fields
     ]
     if missing:
@@ -277,14 +290,23 @@ def _parse_incoming_chunk(fields: dict[str, np.ndarray]) -> IncomingChunk:
 
     root_quat = _as_frame_matrix(fields["body_quat_w"], 4, "body_quat_w")
     wrist = _extract_wrist_frames(fields["joint_pos"])
+    head_joint_pos = _as_frame_matrix(
+        fields["head_joint_pos"], 2, "head_joint_pos"
+    )
     frame_indices = np.asarray(fields["frame_index"], dtype=np.int64).reshape(-1)
 
     n = term1.shape[0]
-    if root_quat.shape[0] != n or wrist.shape[0] != n or frame_indices.shape[0] != n:
+    if (
+        root_quat.shape[0] != n
+        or wrist.shape[0] != n
+        or head_joint_pos.shape[0] != n
+        or frame_indices.shape[0] != n
+    ):
         raise ValueError(
             "PICO pose frame count mismatch: "
             f"frame_index={frame_indices.shape[0]} term1={term1.shape[0]} "
-            f"root={root_quat.shape[0]} wrist={wrist.shape[0]}"
+            f"root={root_quat.shape[0]} wrist={wrist.shape[0]} "
+            f"head={head_joint_pos.shape[0]}"
         )
     if n <= 0:
         raise ValueError("PICO pose message has zero frames")
@@ -292,12 +314,21 @@ def _parse_incoming_chunk(fields: dict[str, np.ndarray]) -> IncomingChunk:
         raise ValueError(
             f"frame_index must be strictly increasing: {frame_indices.tolist()}"
         )
+    for name, values in (
+        ("smpl_joints", term1),
+        ("body_quat_w", root_quat),
+        ("joint_pos", wrist),
+        ("head_joint_pos", head_joint_pos),
+    ):
+        if not np.isfinite(values).all():
+            raise ValueError(f"{name} contains non-finite values")
 
     return IncomingChunk(
         frame_indices=np.ascontiguousarray(frame_indices, dtype=np.int64),
         term1_local=term1,
         root_quat=root_quat,
         wrist=wrist,
+        head_joint_pos=head_joint_pos,
     )
 
 
@@ -319,6 +350,7 @@ class StreamedSmplRefMerger:
         self.term1_local = np.zeros((0, 72), dtype=np.float32)
         self.root_quat = np.zeros((0, 4), dtype=np.float32)
         self.wrist = np.zeros((0, 6), dtype=np.float32)
+        self.head_joint_pos = np.zeros((0, 2), dtype=np.float32)
         self.stream_window_start = 0
         self.current_frame = 0
         self.frame_step = 1
@@ -384,6 +416,7 @@ class StreamedSmplRefMerger:
         new_term1 = np.zeros((new_len, 72), dtype=np.float32)
         new_root = np.zeros((new_len, 4), dtype=np.float32)
         new_wrist = np.zeros((new_len, 6), dtype=np.float32)
+        new_head = np.zeros((new_len, 2), dtype=np.float32)
 
         old_window_start = self.stream_window_start
         if merge_dst_frame > 0 and self.timesteps > 0:
@@ -409,11 +442,15 @@ class StreamedSmplRefMerger:
                     new_wrist[copy_dst_idx : copy_dst_idx + copy_count] = self.wrist[
                         copy_src_idx : copy_src_idx + copy_count
                     ]
+                    new_head[
+                        copy_dst_idx : copy_dst_idx + copy_count
+                    ] = self.head_joint_pos[copy_src_idx : copy_src_idx + copy_count]
 
         n_in = int(chunk.frame_indices.shape[0])
         new_term1[merge_dst_frame : merge_dst_frame + n_in] = chunk.term1_local
         new_root[merge_dst_frame : merge_dst_frame + n_in] = chunk.root_quat
         new_wrist[merge_dst_frame : merge_dst_frame + n_in] = chunk.wrist
+        new_head[merge_dst_frame : merge_dst_frame + n_in] = chunk.head_joint_pos
 
         window_shift_ticks = new_window_start - old_window_start
         window_shift = window_shift_ticks // frame_step if frame_step > 0 else 0
@@ -421,6 +458,7 @@ class StreamedSmplRefMerger:
         self.term1_local = new_term1
         self.root_quat = new_root
         self.wrist = new_wrist
+        self.head_joint_pos = new_head
         self.stream_window_start = new_window_start
         self.frame_step = frame_step
         self.total_merges += 1
@@ -463,6 +501,9 @@ class StreamedSmplRefMerger:
             ),
             "root_quat": np.ascontiguousarray(self.root_quat[idx], dtype=np.float32),
             "wrist": np.ascontiguousarray(self.wrist[idx], dtype=np.float32),
+            "head_joint_pos": np.ascontiguousarray(
+                self.head_joint_pos[idx], dtype=np.float32
+            ),
             "frame_index": np.asarray([current_global_frame], dtype=np.int64),
         }
 

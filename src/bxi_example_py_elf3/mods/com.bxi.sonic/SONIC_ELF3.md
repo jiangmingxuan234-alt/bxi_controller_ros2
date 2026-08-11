@@ -13,8 +13,9 @@ SONIC 已作为标准 Mod 接入主控制器，不再使用独立 supervisor、�
 com.bxi.sonic/sonic_teleop
 ```
 
-该状态执行同一套 29 关节 SONIC 策略，`hardware_gripper: true` 时同时接管左右夹爪；不再
-提供单独的 `sonic_teleop_gripper` 状态。进入和退出 SONIC 使用 `soft_switch`，策略切换仍由
+该状态执行同一套 29 关节 SONIC 策略，并在 PICO `POSE` 模式下追加两个具名头部
+关节命令；`hardware_gripper: true` 时同时接管左右夹爪。不再提供单独的
+`sonic_teleop_gripper` 状态。进入和退出 SONIC 使用 `soft_switch`，策略切换仍由
 框架的两阶段准备和控制线程内切换机制完成。
 
 控制数据路径为：
@@ -26,7 +27,45 @@ PICO 头显/追踪设备
   -> pico_manager（ZMQ pose）
   -> smpl_bridge（ZMQ smpl_ref）
   -> SonicTeleopPolicy
-  -> ELF3 MotorFrame
+  -> 29 关节策略命令 + head_y_joint/head_z_joint
+  -> ELF3 具名 MotorFrame
+```
+
+PICO 头部控制与 `com.bxi.pico_gmr_motion` 使用同一套语义：
+
+```text
+relative_head = inverse(Spine3) * Head
+head_y_joint = -relative XYZ roll
+head_z_joint =  relative XYZ pitch
+```
+
+`states.sonic_teleop.params.head_control_enabled` 默认为 `true`。关闭后状态的自然输出
+从 31 关节恢复为策略原生的 29 个身体关节，不再创建或更新 PICO 头部命令层。
+
+每次进入 `POSE` 都重置中心姿态。头部目标作为 `head_joint_pos[*,2]` 从 manager 经
+bridge 的十帧滑窗传给策略状态；断流、idle reference 或退出 `POSE` 后目标回零，
+状态按速度限制平滑回中。策略模型输出仍为 29 关节，状态才合成为 31 关节具名帧；
+29 关节机器人会按名称裁掉不存在的头部关节，31 关节机器人则完整接收。
+
+头部参数默认值与 PICO GMR 一致：
+
+| 参数 | 默认值 |
+| --- | ---: |
+| `head_pitch_limit_rad` | `0.5` |
+| `head_yaw_limit_rad` | `1.0` |
+| `head_pitch_speed_rad_s` | `1.5` |
+| `head_yaw_speed_rad_s` | `2.0` |
+| `head_deadband_rad` | `0.015` |
+
+头部 PD 增益为 `kp=16.747` / `kd=1.066`。
+
+进入状态后还会并行启动独立的头部相机图传路径：
+
+```text
+simulation/hardware head camera Image
+  -> head_camera_rtsp_node
+  -> MediaMTX
+  -> rtsp://<机器人IP>:2212/video
 ```
 
 模型和固定参考数据随 Mod 安装：
@@ -47,10 +86,15 @@ reference 和夹爪行为均由 Mod 资源与 `mod.yaml` 明确决定。
 
 ## 进程和生命周期边界
 
-`mod.yaml` 声明两个 state-scoped 节点：
+`mod.yaml` 声明四个 state-scoped 节点：
 
 ```text
 ModNodeManager
+├── mediamtx_server
+│   └── runtime: command / execution: process
+├── head_camera_rtsp
+│   ├── runtime: executable / execution: process
+│   └── depends_on: mediamtx_server
 ├── pico_manager
 │   ├── runtime: command / execution: process
 │   └── runtime_profile: pico_bootstrap
@@ -65,7 +109,7 @@ ModNodeManager
 - `pico_bootstrap` 不预注入 Mod 内的厂商路径；manager 会先检查用户安装，失败后才启用
   当前平台的内置回退。
 - `smpl_bridge` 是宿主 ROS executor 内的原生节点，不继承厂商 Python、SDK 或动态库环境。
-- 两个节点均为 `lifecycle: state`，只在准备或运行 `sonic_teleop` 时存在；离开状态后由
+- 四个节点均为 `lifecycle: state`，只在准备或运行 `sonic_teleop` 时存在；离开状态后由
   框架按依赖逆序回收。
 - manager 普通运行故障最多重启 3 次；依赖或解释器配置错误使用退出码 `78`，框架将其
   视为确定性 fault，不进行无意义重启。
@@ -85,8 +129,14 @@ assets/
 config/
 pico/
 runtime/
+  mediamtx.yml
+  linux-x86_64/mediamtx
+  linux-aarch64/mediamtx
   linux-x86_64/roboticsservice/
   linux-aarch64/roboticsservice/
+bin/
+  linux-x86_64/head_camera_rtsp_node
+  linux-aarch64/head_camera_rtsp_node
 vendor/
   python/
     linux-x86_64-cpython-310/
@@ -141,12 +191,13 @@ cd src/bxi_example_py_elf3/mods/com.bxi.sonic
 当前仓库已经包含 x86_64 和 ARM64 runtime，正常目标机不需要重复此步骤。该命令只适用于
 生成或更新尚不存在的平台目录，并要求 `ldd`、`readelf` 和 `patchelf`。
 
-SONIC 只保留两个部署环境变量：
+SONIC 只保留三个部署环境变量：
 
 | 变量 | 用途 |
 | --- | --- |
 | `SONIC_PICO_PYTHON` | 固定 manager 使用的 Python 解释器 |
 | `SONIC_XRT_SERVICE_DIR` | 显式指定用户 RoboticsService 根目录 |
+| `SONIC_MEDIAMTX_BIN` | 可选；覆盖 Mod 内置 MediaMTX 路径 |
 
 Service 查找顺序是：显式 `SONIC_XRT_SERVICE_DIR`、用户安装的
 `/opt/apps/roboticsservice`、当前平台内置 runtime。用户路径一旦存在便具有权威性；若其

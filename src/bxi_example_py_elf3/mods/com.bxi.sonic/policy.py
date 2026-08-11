@@ -98,6 +98,7 @@ class SmplReferenceFrame:
     term1_local: np.ndarray
     root_quat: np.ndarray
     wrist: np.ndarray
+    head_joint_pos: np.ndarray
     anchor_quat: Optional[np.ndarray] = None
     frame_index: int = -1
     sequence: int = 0
@@ -306,6 +307,7 @@ class SonicTeleopPolicy(JointPolicy):
         self.yaw_aligned = False
         self.yaw_offset = 0.0
         self.latest_live_ref: Optional[SmplReferenceFrame] = None
+        self.head_joint_target = np.zeros(2, dtype=np.float32)
         self.latest_live_ref_time = 0.0
         self.live_sequence = 0
         self.reference_source: Optional[str] = None
@@ -501,6 +503,7 @@ class SonicTeleopPolicy(JointPolicy):
         self.yaw_aligned = False
         self.yaw_offset = 0.0
         self.latest_live_ref = None
+        self.head_joint_target.fill(0.0)
         self.latest_live_ref_time = 0.0
         self.live_sequence = 0
         self.reference_source = None
@@ -583,13 +586,21 @@ class SonicTeleopPolicy(JointPolicy):
             term1_local=_as_window(fields["term1_local"], 72, "term1_local"),
             root_quat=_as_window(fields["root_quat"], 4, "root_quat"),
             wrist=_as_window(fields["wrist"], 6, "wrist"),
+            head_joint_pos=_as_window(
+                fields["head_joint_pos"], 2, "head_joint_pos"
+            ),
             anchor_quat=_as_window(anchor, 4, "anchor_quat")
             if anchor is not None
             else None,
             frame_index=index,
             sequence=self.live_sequence + 1,
         )
-        arrays = [frame.term1_local, frame.root_quat, frame.wrist]
+        arrays = [
+            frame.term1_local,
+            frame.root_quat,
+            frame.wrist,
+            frame.head_joint_pos,
+        ]
         if frame.anchor_quat is not None:
             arrays.append(frame.anchor_quat)
         if not all(np.isfinite(array).all() for array in arrays):
@@ -612,6 +623,7 @@ class SonicTeleopPolicy(JointPolicy):
             term1_local=np.ascontiguousarray(self.ref_term1[idx], dtype=np.float32),
             root_quat=np.ascontiguousarray(self.ref_root_quat[idx], dtype=np.float32),
             wrist=np.ascontiguousarray(self.ref_wrist[idx], dtype=np.float32),
+            head_joint_pos=np.zeros((WINDOW, 2), dtype=np.float32),
             anchor_quat=np.ascontiguousarray(anchor, dtype=np.float32)
             if anchor is not None
             else None,
@@ -751,6 +763,10 @@ class SonicTeleopPolicy(JointPolicy):
         omega = np.asarray(omega, dtype=np.float32).reshape(3)
 
         frame, source, now_mono = self._active_reference()
+        if source == "live":
+            np.copyto(self.head_joint_target, frame.head_joint_pos[-1])
+        else:
+            self.head_joint_target.fill(0.0)
         self._begin_source_transition(source, now_mono)
 
         model_input = self._build_model_input(frame, q, dq, quat_wxyz, omega)

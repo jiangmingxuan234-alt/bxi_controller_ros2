@@ -36,6 +36,14 @@ def _build_state(
         live_reference_timeout_s=state.float_param("live_reference_timeout_s", 0.5),
         idle_frame_start=state.int_param("idle_frame_start", 3509),
         source_blend_seconds=state.float_param("source_blend_seconds", 0.4),
+        head_control_enabled=state.bool_param("head_control_enabled", True),
+        head_pitch_limit_rad=state.float_param("head_pitch_limit_rad", 0.5),
+        head_yaw_limit_rad=state.float_param("head_yaw_limit_rad", 1.0),
+        head_pitch_speed_rad_s=state.float_param(
+            "head_pitch_speed_rad_s", 1.5
+        ),
+        head_yaw_speed_rad_s=state.float_param("head_yaw_speed_rad_s", 2.0),
+        head_deadband_rad=state.float_param("head_deadband_rad", 0.015),
         hardware_gripper=state.bool_param("hardware_gripper", False),
         gripper_enable_interval_s=state.float_param(
             "gripper_enable_interval_s",
