@@ -117,8 +117,12 @@ class AnyMotionState(
         ctx: RobotControlContext,
         from_state: StateBehavior[RobotControlContext],
     ) -> None:
-        # ctx.preheat_model(self.policy)
-        ...
+        del from_state
+        self.playing = True
+        # The on-demand policy instance survives state exits.  Reset the
+        # reference cursor and all recurrent state before every transition so
+        # re-entering always replays from the configured start_frame.
+        self.policy.reset(ctx.inference_frame)
 
     def on_enter(self, ctx: RobotControlContext) -> None:
         self.playing = True
