@@ -223,7 +223,7 @@ states:
       gripper_maximum_search_travel_rad: 7.0
       gripper_response_timeout_s: 1.0
       gripper_feedback_timeout_s: 0.3
-      gripper_phase_timeout_s: 5.0
+      gripper_phase_timeout_s: 15.0
       gripper_maximum_mos_temperature_c: 120
       gripper_maximum_motor_temperature_c: 120
 
