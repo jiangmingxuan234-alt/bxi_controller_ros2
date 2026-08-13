@@ -219,7 +219,16 @@ class SonicTeleopState(
             getattr(bxi_msg, "CanfdPacket", None),
         )
         if packet_type is None:
-            self.logger.error("SONIC夹爪不可用：缺少communication.msg.CANFDPacket")
+            # The gripper is an optional SONIC peripheral.  Some simulation
+            # and deployment message packages do not expose the CAN FD packet
+            # type, so degrade to body-only teleoperation instead of making
+            # the complete SONIC state unavailable.
+            self.hardware_gripper = False
+            self._gripper_available = True
+            self.logger.warning(
+                "SONIC夹爪已禁用：缺少communication.msg.CANFDPacket；"
+                "全身遥操仍可用"
+            )
             return
         qos = QoSProfile(depth=1)
         self._gripper_subscriptions = [

@@ -43,8 +43,9 @@ head_z_joint =  relative XYZ pitch
 从 31 关节恢复为策略原生的 29 个身体关节，不再创建或更新 PICO 头部命令层。
 
 每次进入 `POSE` 都重置中心姿态。头部目标作为 `head_joint_pos[*,2]` 从 manager 经
-bridge 的十帧滑窗传给策略状态；断流、idle reference 或退出 `POSE` 后目标回零，
-状态按速度限制平滑回中。策略模型输出仍为 29 关节，状态才合成为 31 关节具名帧；
+bridge source chunk 与身体一起传给 policy 的十帧窗口；首次 live 前或显式状态重置时
+目标回零，live 断流后则与身体一起保持最后完整窗口。策略模型输出仍为 29 关节，状态
+才合成为 31 关节具名帧；
 29 关节机器人会按名称裁掉不存在的头部关节，31 关节机器人则完整接收。
 
 头部参数默认值与 PICO GMR 一致：
@@ -265,13 +266,16 @@ ros2 launch remote_controller remote_controller_keyboard.launch.py
 2. 如果此时身体追踪数据还未到达，请求会被保留；第一帧新鲜 body 数据到达后自动完成，
    不需要反复按键。
 3. 校准完成后同时按 `A+X`，从 PLANNER 切换到实时 POSE。
-4. bridge 收到连续、有限、帧号前进且标记校准完成的 POSE 数据后，发布 live
-   `smpl_ref`；policy 经过 `source_blend_seconds` 平滑切入 live reference。
+4. bridge 收到连续、有限、帧号前进且标记校准完成的 POSE 数据后，逐包转发完整
+   source chunk；policy 经过 `source_blend_seconds` 平滑切入 live reference，并独占
+   十帧窗口的播放游标。
 
 当前 `require_live_reference: false`，因此 PICO 尚未就绪时 SONIC 仍使用
 `assets/stream_reference.npz` 中固定的 idle window 运行推理，不会卡在非策略默认姿态。
-live 数据超过 `live_reference_timeout_s` 后会丢弃陈旧包，并平滑退回 idle，而不是重复
-播放最后一帧。重新进入或重置状态不会复用上一次会话的 live packet。
+首次 live 窗口到达后，policy 每次成功推理最多推进一帧；缺少新 chunk 时先消费剩余
+缓冲，随后持续保持最后一个完整十帧窗口。它不会尾帧 clamp，也不会因短时断流退回 idle。
+`live_reference_timeout_s` 只用于新鲜度状态和告警；重新进入或显式重置状态才清除上一
+会话的 live packet，并重新使用自采站姿 reference。
 
 `A+B+X+Y` 完成的是 PICO 三点追踪与 ELF3 FK 参考的对齐，同时作为操作者就绪握手；
 `calibration_ready=true` 不应解释为对 SONIC 原始 SMPL tensor 的另一套数值标定。
@@ -359,7 +363,7 @@ RoboticsService 以及本次创建的 5556/5557/60061 监听都应被回收。
   tracking 流尚未到达；应检查头显端 Body Tracking、目标 PC IP 和发送状态。
 - manager 退出码 `78`：解释器、binding、SDK 或 service runtime 配置不完整。
 - `idle_reference`：当前使用内置固定参考。
-- `live_stale_to_idle`：live reference 已过期，正在平滑退回 idle。
+- `stale_hold`：live source 已过期，policy 正保持最后一个完整十帧窗口。
 
 ## 验收清单
 
@@ -369,7 +373,7 @@ RoboticsService 以及本次创建的 5556/5557/60061 监听都应被回收。
 3. 未连接 PICO 时确认策略继续使用 `idle_reference` 推理，控制器不因等待 live 数据阻塞。
 4. 连接 PICO 后完成 `A+B+X+Y -> A+X`，确认切到 live reference，并观察动作方向和
    朝向是否正确。
-5. 中断 PICO 数据，确认在超时后平滑退回 idle；恢复数据后再次平滑切入。
+5. 中断 PICO 数据，确认先消费剩余缓冲并保持最后完整窗口；恢复数据后继续顺序消费。
 6. 在空载和安全条件下验证夹爪 trigger 松开门槛、左右映射、输入短暂中断和状态退出。
 7. 离开 SONIC，确认 manager、bridge 和 RoboticsService 均按生命周期清理；重新进入后
    能重新创建且不发生端口冲突。

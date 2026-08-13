@@ -479,6 +479,13 @@ bridge 的 endpoint、topic、频率和新鲜度配置在 `mod.yaml` 的 node `p
 声明，由 `NodeBuildContext` 注入，不读取散落的环境变量，也不再提供 wrapper 命令行
 兼容入口。
 
+bridge 的 50 Hz timer 只负责非阻塞排空 ZMQ 和转发完整 rolling source chunk，不是
+reference 播放时钟；它不维护 playhead、不等待 ACK，也不合成或复制未来帧。Policy 在
+控制线程内按顺序合并 source chunk，始终 gather 完整的 `current+[0..9]`，仅在 ONNX
+推理和动作解码成功后最多推进一帧。源帧晚到会保持当前窗口，burst 到达仍逐帧消费，
+断流会在缓冲耗尽后保持最后完整窗口；`BXI_SONIC_TELEMETRY_LOG_EVERY=N` 可按 N 个成功
+推理 tick 输出一次 `[sonic-playback-telemetry]` JSON，用于审计实际消费序列。
+
 ## 部署检查
 
 默认检查会自动选择当前平台内置 runtime，不修改任何内容：
@@ -504,10 +511,11 @@ ss -lntup | grep -E ':(60061|5556|5557)\b'
 
 ## 实时 reference 与 idle fallback
 
-默认 `require_live_reference: false`。进入状态时允许使用随 Mod 安装的 idle reference；
-PICO 同时按住 `A+B+X+Y` 请求校准后平滑切到 live reference，数据过期后平滑退回
-idle。按键请求与身体追踪数据解耦：若按下组合键时身体流尚未就绪，manager 会保留这次
-请求，并在第一帧新鲜身体数据到达后自动完成校准，不需要反复按键。
+默认 `require_live_reference: false`。进入状态时允许使用随 Mod 安装的自采站姿
+reference；PICO 同时按住 `A+B+X+Y` 请求校准后平滑切到 live reference。首次 live
+成功后，短时或长期断流均保持最后完整窗口而不回 idle；重新进入或显式重置状态才回到
+站姿 reference。按键请求与身体追踪数据解耦：若按下组合键时身体流尚未就绪，manager
+会保留这次请求，并在第一帧新鲜身体数据到达后自动完成校准，不需要反复按键。
 
 启动日志会明确区分三个阶段：
 
