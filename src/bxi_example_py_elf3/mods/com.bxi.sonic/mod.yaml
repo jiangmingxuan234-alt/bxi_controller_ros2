@@ -160,9 +160,6 @@ nodes:
       out_port: 5557
       out_topic: smpl_ref
       rate_hz: 50.0
-      history_frames: 5
-      max_gap_frames: 200
-      catch_up_enabled: true
       stale_warning_seconds: 0.5
     manifest:
       label: SONIC SMPL参考桥
