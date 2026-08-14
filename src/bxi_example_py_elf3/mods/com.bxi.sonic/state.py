@@ -41,6 +41,9 @@ if TYPE_CHECKING:
 
 
 HEAD_JOINT_NAMES = ("head_y_joint", "head_z_joint")
+DEFAULT_OPERATOR_PROMPT = (
+    "PICO同时按住A+B+X+Y请求校准，再按A+X切入实时POSE"
+)
 SONIC_HEAD_JOINTS = JointLayout(HEAD_JOINT_NAMES, label="SONIC PICO head command")
 SONIC_OUTPUT_JOINTS = JointLayout(
     (*ELF3_POLICY_JOINTS.names, *SONIC_HEAD_JOINTS.names),
@@ -106,6 +109,7 @@ class SonicTeleopState(
         live_reference_timeout_s: float = 0.5,
         idle_frame_start: int = 3509,
         source_blend_seconds: float = 0.4,
+        operator_prompt: str = DEFAULT_OPERATOR_PROMPT,
         head_control_enabled: bool = True,
         head_pitch_limit_rad: float = 0.5,
         head_yaw_limit_rad: float = 1.0,
@@ -146,6 +150,9 @@ class SonicTeleopState(
         self.live_reference_timeout_s = float(live_reference_timeout_s)
         self.idle_frame_start = int(idle_frame_start)
         self.source_blend_seconds = float(source_blend_seconds)
+        self.operator_prompt = str(operator_prompt)
+        if not self.operator_prompt:
+            raise ValueError("SONIC operator_prompt must not be empty")
         self.head_control_enabled = bool(head_control_enabled)
         self.head_pitch_limit_rad = float(head_pitch_limit_rad)
         self.head_yaw_limit_rad = float(head_yaw_limit_rad)
@@ -433,8 +440,7 @@ class SonicTeleopState(
             else "头部跟踪已关闭"
         )
         self.logger.info(
-            f"{mode}已启动；{head_status}；"
-            "PICO同时按住A+B+X+Y请求校准，再按A+X切入实时POSE"
+            f"{mode}已启动；{head_status}；{self.operator_prompt}"
         )
         if self.hardware_gripper:
             self._left_trigger = self._right_trigger = 0.0

@@ -7,7 +7,7 @@ from bxi_example_py_elf3.framework.mod_api import (
 )
 
 from .policy import SonicTeleopPolicy
-from .state import SonicTeleopState
+from .state import DEFAULT_OPERATOR_PROMPT, SonicTeleopState
 
 
 SONIC_POLICY = ResourceKey[SonicTeleopPolicy]("com.bxi.sonic/policy")
@@ -36,6 +36,10 @@ def _build_state(
         live_reference_timeout_s=state.float_param("live_reference_timeout_s", 0.5),
         idle_frame_start=state.int_param("idle_frame_start", 3509),
         source_blend_seconds=state.float_param("source_blend_seconds", 0.4),
+        operator_prompt=state.string_param(
+            "operator_prompt",
+            DEFAULT_OPERATOR_PROMPT,
+        ),
         head_control_enabled=state.bool_param("head_control_enabled", True),
         head_pitch_limit_rad=state.float_param("head_pitch_limit_rad", 0.5),
         head_yaw_limit_rad=state.float_param("head_yaw_limit_rad", 1.0),
@@ -116,6 +120,7 @@ def create_mod(context: ModLoadContext) -> ModDefinition:
     return ModDefinition(
         state_factories={
             "sonic_teleop": lambda state: _build_state(state, policy),
+            "sonic_zerolab": lambda state: _build_state(state, policy),
         }
     )
 

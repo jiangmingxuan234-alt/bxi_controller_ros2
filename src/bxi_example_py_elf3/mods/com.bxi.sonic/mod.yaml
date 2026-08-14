@@ -171,10 +171,73 @@ nodes:
         - package: std_msgs
       system: []
 
+  zerolab_source:
+    runtime: python
+    entrypoint: zerolab.source_node:create_node
+    execution: process
+    runtime_profile: host_ros
+    lifecycle: state
+    states: [sonic_zerolab]
+    params:
+      udp_bind_host: 0.0.0.0
+      udp_port: 18000
+      allowed_sender: 192.168.89.171
+      pose_host: 127.0.0.1
+      pose_port: 5558
+      pose_topic: pose
+      rate_hz: 50.0
+      window_frames: 10
+      stale_seconds: 0.5
+      record_path: ""
+    manifest:
+      label: ZeroLab姿态源
+    runtime_requirements:
+      python:
+        - import: numpy
+        - import: scipy
+        - import: zmq
+      ros:
+        - package: rclpy
+      system: []
+    shutdown:
+      signal: SIGINT
+      terminate_after: 3.0
+      kill_after: 5.0
+
+  zerolab_bridge:
+    runtime: python
+    entrypoint: pico.pose_to_smpl_ref_bridge:create_node
+    execution: in_process
+    runtime_profile: host_ros
+    lifecycle: state
+    states: [sonic_zerolab]
+    depends_on: [zerolab_source]
+    params:
+      pico_host: 127.0.0.1
+      pico_port: 5558
+      pico_topic: pose
+      out_host: 127.0.0.1
+      out_port: 5557
+      out_topic: smpl_ref
+      rate_hz: 50.0
+      stale_warning_seconds: 0.5
+    manifest:
+      label: ZeroLab SMPL参考桥
+    runtime_requirements:
+      python:
+        - import: zmq
+      ros:
+        - package: rclpy
+        - package: std_msgs
+      system: []
+
 events:
   activate:
     slot: btn_10
     value: 9
+  activate_zerolab:
+    slot: btn_10
+    value: 11
   reset_alignment:
     slot: btn_9
     value: 1
@@ -227,6 +290,24 @@ states:
       gripper_maximum_mos_temperature_c: 120
       gripper_maximum_motor_temperature_c: 120
 
+  sonic_zerolab:
+    manifest:
+      label: SONIC ZeroLab遥操
+      priority: 839
+      group: Advanced
+      icon: accessibility_new
+      confirm: true
+      confirm_message: 请先摆好T-pose；进入后保持不动，直到日志显示ZeroLab stream ready
+    params:
+      operator_prompt: 请保持T-pose，直到ZeroLab stream ready后再开始动作
+      require_live_reference: false
+      yaw_bias_rad: 1.57079632679
+      live_reference_timeout_s: 0.5
+      idle_frame_start: 3509
+      source_blend_seconds: 0.4
+      head_control_enabled: false
+      hardware_gripper: false
+
 routes:
   - from: com.bxi.basic_actions/normal
     event: activate
@@ -243,6 +324,24 @@ routes:
     event: com.bxi.basic_actions/pd_brake
     to: com.bxi.basic_actions/pd_brake
   - from: sonic_teleop
+    event: com.bxi.basic_actions/recover
+    to: com.bxi.basic_actions/recover
+    transition: soft_switch
+  - from: com.bxi.basic_actions/normal
+    event: activate_zerolab
+    to: sonic_zerolab
+    transition: soft_switch
+  - from: sonic_zerolab
+    event: com.bxi.basic_actions/normal
+    to: com.bxi.basic_actions/normal
+    transition: soft_switch
+  - from: sonic_zerolab
+    event: com.bxi.basic_actions/zero_torque
+    to: com.bxi.basic_actions/zero_torque
+  - from: sonic_zerolab
+    event: com.bxi.basic_actions/pd_brake
+    to: com.bxi.basic_actions/pd_brake
+  - from: sonic_zerolab
     event: com.bxi.basic_actions/recover
     to: com.bxi.basic_actions/recover
     transition: soft_switch
