@@ -532,3 +532,98 @@ reference；PICO 同时按住 `A+B+X+Y` 请求校准后平滑切到 live referen
 reference 时进入。因为可用性检查发生在 state-scoped 节点 prepare 之前，首次进入时
 需要把 `pico_manager` 和 `smpl_bridge` 都改成 `lifecycle: mod`，让 PICO 数据流在状态
 切换请求之前已经运行。
+
+## ZeroLab 实时 MuJoCo 遥操
+
+固定条件：MotionCaptureMaster 关闭镜像；Windows 发送端为 `192.168.89.171`；以
+50 Hz、每包 992 字节向 Ubuntu `192.168.88.161:18000` 发送 UDP。ZeroLab 状态使用
+`btn_10=11`，不会启动 PICO manager、RoboticsService、RTSP 或夹爪/头部控制。
+
+不要同时运行 `zerolab.record_cli`、UDP 录制回放、独立 `zerolab_source` 或独立 bridge；
+它们会竞争 18000、5558 或 5557 端口。
+
+终端1启动当前工作树及其万能测试场 MuJoCo：
+
+```bash
+cd /home/fazepurple/ros2_ws/bxi_rl_controller_ros2_example_dev/.worktrees/konodoki-dev
+source /opt/ros/humble/setup.bash
+source /home/fazepurple/ros2_ws/bxi_ros2_pkg/setup.bash
+source install/setup.bash
+export ROS_DOMAIN_ID=42
+ros2 launch bxi_example_py_elf3 example_demo.launch.py
+```
+
+终端2只做状态控制：
+
+```bash
+cd /home/fazepurple/ros2_ws/bxi_rl_controller_ros2_example_dev/.worktrees/konodoki-dev
+source /opt/ros/humble/setup.bash
+source /home/fazepurple/ros2_ws/bxi_ros2_pkg/setup.bash
+source install/setup.bash
+export ROS_DOMAIN_ID=42
+```
+
+先进入 PD brake，再进入 normal：
+
+```bash
+ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{}'
+ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{btn_3: 1}'
+ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{}'
+sleep 3
+```
+
+```bash
+ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{btn_1: 1}'
+ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{}'
+sleep 5
+```
+
+操作者先摆好标准 T-pose，再进入 ZeroLab：
+
+```bash
+ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{btn_10: 11}'
+ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{}'
+sleep 1
+```
+
+持续保持 T-pose，直到终端1先后显示：
+
+```text
+ZeroLab stream ready; frame=...
+PICO source chunks ready; sent=...
+```
+
+100 帧标定期间 MuJoCo 使用 idle policy 姿态，窗口里没有显示人体 T-pose 属于正常现象；
+不能把 MuJoCo 是否摆出 T-pose 当作标定完成信号。两条 ready 日志都出现后才放下双臂并
+开始动作。
+
+检查状态和三个监听端口：
+
+```bash
+ros2 topic echo --no-daemon --once --full-length --field data /simulation/state_machine_info std_msgs/msg/String
+ss -H -lunp 'sport = :18000'
+ss -H -ltnp 'sport = :5558'
+ss -H -ltnp 'sport = :5557'
+```
+
+正常退出并释放端口：
+
+```bash
+ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{btn_1: 1}'
+ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{}'
+sleep 3
+```
+
+动作异常时进入 PD brake：
+
+```bash
+ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{btn_3: 1}'
+ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{}'
+```
+
+仅在操作者明确需要完全卸力时使用 zero torque：
+
+```bash
+ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{btn_2: 1}'
+ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{}'
+```
