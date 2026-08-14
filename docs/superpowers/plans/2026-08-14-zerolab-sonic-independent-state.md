@@ -34,6 +34,7 @@
 - Create: `src/bxi_example_py_elf3/mods/com.bxi.sonic/zerolab/converter.py`
 - Create: `src/bxi_example_py_elf3/mods/com.bxi.sonic/zerolab/recording.py`
 - Create: `src/bxi_example_py_elf3/mods/com.bxi.sonic/zerolab/source_node.py`
+- Create: `src/bxi_example_py_elf3/mods/com.bxi.sonic/pico/gear_sonic/trl/utils/elf3_wrist.py`
 - Create: `src/bxi_example_py_elf3/test/test_zerolab_protocol.py`
 - Create: `src/bxi_example_py_elf3/test/test_zerolab_udp_receiver.py`
 - Create: `src/bxi_example_py_elf3/test/test_zerolab_converter.py`
@@ -42,6 +43,7 @@
 **Interfaces:**
 - Consumes: the current Mod loader's dynamic package path, existing `pico.gear_sonic.trl` NumPy/SMPL helpers, and `pico.zmq_messages.pack_pose_message`.
 - Produces: `parse_zerolab_packet`, `ZeroLabUdpReceiver`, `ZeroLabMotionConverter`, `PoseChunkWindow`, `ZeroLabSourceCore`, `ZeroLabSourceNode`, and `create_node(context)` for later manifest integration.
+- Restores dependency: immutable helper `build_elf3_joint_pos`, matching the wrist formula already inlined in the current PICO manager without changing either mapping.
 
 - [ ] **Step 1: Add the four existing baseline test files before production files**
 
@@ -82,6 +84,7 @@ c4f9a28f5f5375b45d122839782f033280b22e80  zerolab/__init__.py
 31b93cafd45af80019244f82e7f1a05b73ff100f  zerolab/converter.py
 dcbf49a6a972941fefefc1027f0408f047b21e9e  zerolab/recording.py
 dff39c4347e73b8222ec1ca9a448b4fc7f39edf6  zerolab/source_node.py
+bfaf2c531aa63465e1d33492a983f5fea209d680  pico/gear_sonic/trl/utils/elf3_wrist.py
 ```
 
 Do not include `record_cli.py`, paired recording or offline evaluation code; the realtime state does not use them.
@@ -95,10 +98,11 @@ git hash-object \
   src/bxi_example_py_elf3/mods/com.bxi.sonic/zerolab/udp_receiver.py \
   src/bxi_example_py_elf3/mods/com.bxi.sonic/zerolab/converter.py \
   src/bxi_example_py_elf3/mods/com.bxi.sonic/zerolab/recording.py \
-  src/bxi_example_py_elf3/mods/com.bxi.sonic/zerolab/source_node.py
+  src/bxi_example_py_elf3/mods/com.bxi.sonic/zerolab/source_node.py \
+  src/bxi_example_py_elf3/mods/com.bxi.sonic/pico/gear_sonic/trl/utils/elf3_wrist.py
 ```
 
-Expected in order: `c4f9a28f...`, `4006fac5...`, `3f1361f9...`, `31b93caf...`, `dcbf49a6...`, `dff39c43...`.
+Expected in order: `c4f9a28f...`, `4006fac5...`, `3f1361f9...`, `31b93caf...`, `dcbf49a6...`, `dff39c43...`, `bfaf2c53...`.
 
 - [ ] **Step 5: Run the baseline tests and verify GREEN**
 
@@ -109,6 +113,7 @@ Run the Step 2 command again. All selected tests must pass; converter golden-vec
 ```bash
 git add \
   src/bxi_example_py_elf3/mods/com.bxi.sonic/zerolab \
+  src/bxi_example_py_elf3/mods/com.bxi.sonic/pico/gear_sonic/trl/utils/elf3_wrist.py \
   src/bxi_example_py_elf3/test/test_zerolab_protocol.py \
   src/bxi_example_py_elf3/test/test_zerolab_udp_receiver.py \
   src/bxi_example_py_elf3/test/test_zerolab_converter.py \
