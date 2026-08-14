@@ -186,6 +186,9 @@ class PoseChunkWindow:
             "joint_pos": np.stack(
                 [values["joint_pos"] for _, values in frames]
             ).astype(np.float32),
+            "head_joint_pos": np.zeros(
+                (len(frames), 2), dtype=np.float32
+            ),
             "stream_mode": np.array([1], dtype=np.int32),
             "calibration_ready": np.array([True], dtype=bool),
         }
