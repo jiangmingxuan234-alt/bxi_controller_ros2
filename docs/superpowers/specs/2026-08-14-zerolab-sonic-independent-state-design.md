@@ -1,6 +1,6 @@
 # ZeroLab 独立 SONIC 状态设计
 
-日期：2026-08-14  
+日期：2026-08-14
 目标分支：`test/konodoki-dev`，基于 `konodoki/dev@efbce8d`
 
 ## 目标
