@@ -563,7 +563,7 @@ source install/setup.bash
 export ROS_DOMAIN_ID=42
 ```
 
-先进入 PD brake，再进入 normal：
+先进入 PD brake，再进入 normal，并等待机器人以 idle policy 稳定站立：
 
 ```bash
 ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{}'
@@ -578,7 +578,7 @@ ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{}'
 sleep 5
 ```
 
-操作者先摆好标准 T-pose，再进入 ZeroLab：
+进入 ZeroLab；此时机器人保持进入瞬间捕获的 normal 指令，不会立即接管人体目标：
 
 ```bash
 ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{btn_10: 11}'
@@ -586,16 +586,39 @@ ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{}'
 sleep 1
 ```
 
-持续保持 T-pose，直到终端1先后显示：
+操作者再持续保持标准 T-pose，直到终端1显示 source、bridge 已就绪并进入
+`WAIT_ARM`：
 
 ```text
 ZeroLab stream ready; frame=...
 PICO source chunks ready; sent=...
+ZeroLab ARM phase: WAIT_ARM
 ```
 
 100 帧标定期间 MuJoCo 使用 idle policy 姿态，窗口里没有显示人体 T-pose 属于正常现象；
-不能把 MuJoCo 是否摆出 T-pose 当作标定完成信号。两条 ready 日志都出现后才放下双臂并
-开始动作。
+不能把 MuJoCo 是否摆出 T-pose 当作标定完成信号。以上日志全部出现后，操作者放下双臂，
+回到准备接管的中立姿态。系统没有自动的人体姿态安全门，安全员必须自行确认目标姿态正确。
+
+安全员先准备好下面相邻的 PD brake 命令，确认操作者保持中立姿态后，再发送 ARM：
+
+```bash
+ros2 topic pub --once /motion_commands \
+  communication/msg/MotionCommands '{btn_10: 12}'
+ros2 topic pub --once /motion_commands \
+  communication/msg/MotionCommands '{}'
+```
+
+动作异常时立即进入 PD brake：
+
+```bash
+ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{btn_3: 1}'
+ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{}'
+```
+
+ARM 后的两秒交接期间继续保持中立姿态。两秒 blend 可以减小指令跳变，但不能纠正错误的
+目标姿态。输入过期时机器人保持最后一帧指令并取消 ARM；新鲜输入恢复后仍需再次发送
+`btn_10=12`，系统不会自动进入 PD brake，也不会自动恢复人体控制。离开并重新进入 ZeroLab
+后，必须重新完成一次 T-pose 标定。
 
 检查状态和三个监听端口：
 
@@ -612,13 +635,6 @@ ss -H -ltnp 'sport = :5557'
 ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{btn_1: 1}'
 ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{}'
 sleep 3
-```
-
-动作异常时进入 PD brake：
-
-```bash
-ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{btn_3: 1}'
-ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{}'
 ```
 
 仅在操作者明确需要完全卸力时使用 zero torque：
