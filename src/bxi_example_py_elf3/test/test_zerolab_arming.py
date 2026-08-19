@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -109,14 +109,17 @@ class FakeContext:
 
 
 class CaptureLogger:
-    def info(self, _message):
-        pass
+    def __init__(self):
+        self.messages = []
 
-    def warning(self, _message):
-        pass
+    def info(self, message):
+        self.messages.append(("info", message))
 
-    def error(self, _message):
-        pass
+    def warning(self, message):
+        self.messages.append(("warning", message))
+
+    def error(self, message):
+        self.messages.append(("error", message))
 
 
 def make_state(*, entry_value=0.0, arm_blend_seconds=2.0):
@@ -164,6 +167,40 @@ def armed_state_at_half_blend():
     return state, policy, ctx
 
 
+def fully_armed_state():
+    state, policy, ctx = prepared_state(entry_value=0.0)
+    policy.fresh = True
+    state.sample_running_frame(ctx, 0.02, advance=True)
+    assert state.on_action(ctx, "arm_zerolab") is True
+    policy.target.position.fill(2.0)
+    state.sample_running_frame(ctx, 2.0, advance=True)
+    assert state.arm_phase is ZeroLabArmPhase.ARMED
+    return state, policy, ctx
+
+
+def state_in_active_phase(phase):
+    state, policy, ctx = fully_armed_state()
+    if phase is ZeroLabArmPhase.BLENDING:
+        state, policy, ctx = armed_state_at_half_blend()
+    return state, policy, ctx
+
+
+def stale_hold_state():
+    state, policy, ctx = fully_armed_state()
+    policy.fresh = False
+    state.sample_running_frame(ctx, 0.02, advance=True)
+    assert state.arm_phase is ZeroLabArmPhase.HOLD_STALE
+    return state, policy, ctx
+
+
+def waiting_arm_state():
+    state, policy, ctx = prepared_state(entry_value=0.0)
+    policy.fresh = True
+    state.sample_running_frame(ctx, 0.02, advance=True)
+    assert state.arm_phase is ZeroLabArmPhase.WAIT_ARM
+    return state, policy, ctx
+
+
 def copy_motor_frame(frame):
     return MotorFrame.create(
         frame.layout,
@@ -173,6 +210,14 @@ def copy_motor_frame(frame):
         vel=frame.vel,
         torque=frame.torque,
     )
+
+
+def assert_motor_frames_equal(actual, expected):
+    np.testing.assert_allclose(actual.qpos, expected.qpos)
+    np.testing.assert_allclose(actual.kp, expected.kp)
+    np.testing.assert_allclose(actual.kd, expected.kd)
+    np.testing.assert_allclose(actual.vel, expected.vel)
+    np.testing.assert_allclose(actual.torque, expected.torque)
 
 
 def test_arm_blend_seconds_must_be_finite_and_positive():
@@ -240,3 +285,73 @@ def test_duplicate_arm_does_not_restart_blend():
     assert state.on_action(ctx, "arm_zerolab") is True
     assert state._blend_elapsed_s == before
     assert state.arm_phase is ZeroLabArmPhase.BLENDING
+
+
+@pytest.mark.parametrize("starting_phase", [
+    ZeroLabArmPhase.BLENDING,
+    ZeroLabArmPhase.ARMED,
+])
+def test_stale_reference_freezes_last_applied_frame_and_cancels_arm(starting_phase):
+    state, policy, ctx = state_in_active_phase(starting_phase)
+    before = copy_motor_frame(state.sample_running_frame(ctx, 0.02, advance=True))
+    policy.fresh = False
+    policy.target.position.fill(9.0)
+
+    after = state.sample_running_frame(ctx, 0.02, advance=True)
+
+    assert state.arm_phase is ZeroLabArmPhase.HOLD_STALE
+    assert_motor_frames_equal(after, before)
+
+
+def test_recovery_does_not_resume_until_rearmed():
+    state, policy, ctx = stale_hold_state()
+    frozen = copy_motor_frame(state.sample_running_frame(ctx, 0.02, advance=True))
+    policy.fresh = True
+    policy.target.position.fill(2.0)
+
+    waiting = state.sample_running_frame(ctx, 0.02, advance=True)
+    assert state.arm_phase is ZeroLabArmPhase.HOLD_STALE
+    assert_motor_frames_equal(waiting, frozen)
+
+    state.on_action(ctx, "arm_zerolab")
+    resumed = state.sample_running_frame(ctx, 0.0, advance=True)
+    assert state.arm_phase is ZeroLabArmPhase.BLENDING
+    assert_motor_frames_equal(resumed, frozen)
+
+
+def test_wait_arm_gap_never_changes_held_normal_frame():
+    state, policy, ctx = waiting_arm_state()
+    policy.fresh = False
+    frame = state.sample_running_frame(ctx, 1.0, advance=True)
+    assert state.arm_phase is ZeroLabArmPhase.WAIT_ARM
+    assert_motor_frames_equal(frame, state.get_entry_frame(ctx))
+
+
+def test_exit_clears_arm_session_and_next_prepare_requires_calibration():
+    state, policy, ctx = fully_armed_state()
+    state.on_exit(ctx)
+    policy.fresh = False
+    state.on_prepare(ctx, SimpleNamespace())
+    assert state.arm_phase is ZeroLabArmPhase.WAIT_CALIBRATION
+
+
+def test_stale_and_recovery_logs_are_emitted_once_per_stale_session():
+    state, policy, ctx = fully_armed_state()
+    logger = state.logger
+    policy.fresh = False
+    for _ in range(100):
+        state.sample_running_frame(ctx, 0.02, advance=True)
+    policy.fresh = True
+    for _ in range(100):
+        state.sample_running_frame(ctx, 0.02, advance=True)
+
+    stale_messages = [
+        message for _, message in logger.messages
+        if "ZeroLab reference stale; holding last motor frame and ARM cancelled" in message
+    ]
+    recovery_messages = [
+        message for _, message in logger.messages
+        if "ZeroLab reference recovered; send btn_10=12 to resume" in message
+    ]
+    assert len(stale_messages) == 1
+    assert len(recovery_messages) == 1
