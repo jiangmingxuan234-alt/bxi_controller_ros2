@@ -20,6 +20,7 @@ from bxi_example_py_elf3.policies.joints import ELF3_POLICY_JOINTS
 
 
 MOD_ROOT = Path(__file__).resolve().parents[1] / "mods" / "com.bxi.sonic"
+BASIC_ACTIONS_ROOT = MOD_ROOT.parent / "com.bxi.basic_actions"
 
 
 def load_manifest():
@@ -162,13 +163,17 @@ class EntryLifecycleContext:
 
 def test_source_prompts_and_zerolab_availability_without_live_data():
     resources = ResourceManager()
-    module_prefix = None
+    module_prefixes = []
     try:
-        discovered = _discover_mods((MOD_ROOT,))
+        discovered = _discover_mods((BASIC_ACTIONS_ROOT, MOD_ROOT))
+        basic_definition, basic_module = _load_definition(
+            discovered["com.bxi.basic_actions"], resources
+        )
+        module_prefixes.append(basic_module.__name__.split(".", 1)[0])
         definition, module = _load_definition(
             discovered["com.bxi.sonic"], resources
         )
-        module_prefix = module.__name__.split(".", 1)[0]
+        module_prefixes.append(module.__name__.split(".", 1)[0])
         policy_key = ResourceKey[object]("com.bxi.sonic/policy")
         assert resources.status(policy_key) == "unloaded"
         assert set(definition.state_factories) == {
@@ -183,6 +188,12 @@ def test_source_prompts_and_zerolab_availability_without_live_data():
         assert pico.operator_prompt == (
             "PICO同时按住A+B+X+Y请求校准，再按A+X切入实时POSE"
         )
+
+        normal_context = StateBuildContext(
+            "com.bxi.basic_actions/normal", 0, {}
+        )
+        normal = basic_definition.state_factories["normal"](normal_context)
+        normal_context.finish()
 
         prompt = (
             "T-pose标定期间机器人保持Normal；stream ready后回到中立姿势，"
@@ -201,6 +212,17 @@ def test_source_prompts_and_zerolab_availability_without_live_data():
         )
         zero = definition.state_factories["sonic_zerolab"](zero_context)
         zero_context.finish()
+        sonic_policy_id = "com.bxi.sonic/policy"
+        normal_policy_id = "com.bxi.basic_actions/normal_policy"
+        assert [handle.key.id for handle in pico.required_resources] == [
+            sonic_policy_id
+        ]
+        assert [handle.key.id for handle in zero.required_resources] == [
+            sonic_policy_id,
+            normal_policy_id,
+        ]
+        assert zero._normal_policy.key.id == normal_policy_id
+        assert zero._normal_policy.key == normal._policy.key
         assert type(zero).__name__ == "ZeroLabArmedTeleopState"
         assert zero.arm_blend_seconds == 2.0
         assert zero._policy is pico._policy
@@ -218,8 +240,7 @@ def test_source_prompts_and_zerolab_availability_without_live_data():
         ]
     finally:
         resources.close()
-        if module_prefix is not None:
-            _remove_module_prefixes((module_prefix,))
+        _remove_module_prefixes(tuple(module_prefixes))
 
 
 def test_process_loader_imports_zerolab_source_with_dynamic_package():

@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import time
 from threading import Lock
-from typing import TYPE_CHECKING, Optional, Protocol
+from typing import Any, TYPE_CHECKING, Optional, Protocol
 
 import numpy as np
 import communication.msg as bxi_msg
@@ -104,6 +104,7 @@ class SonicTeleopState(
         state_id: int,
         policy: ResourceHandle[SonicPolicy],
         *,
+        additional_resources: tuple[ResourceHandle[Any], ...] = (),
         require_live_reference: bool = False,
         yaw_bias_rad: float = math.pi / 2.0,
         live_reference_timeout_s: float = 0.5,
@@ -141,7 +142,11 @@ class SonicTeleopState(
         gripper_maximum_mos_temperature_c: int = 80,
         gripper_maximum_motor_temperature_c: int = 80,
     ) -> None:
-        super().__init__(name, state_id, resources=(policy,))
+        super().__init__(
+            name,
+            state_id,
+            resources=(policy, *additional_resources),
+        )
         if gripper_enable_interval_s <= 0.0:
             raise ValueError("gripper_enable_interval_s must be positive")
         self._policy = policy

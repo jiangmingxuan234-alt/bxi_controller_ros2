@@ -6,7 +6,9 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from bxi_example_py_elf3.framework.mod_api import ResourceHandle
 from bxi_example_py_elf3.framework.mod_api.transition import MotorFrame
+from bxi_example_py_elf3.policies import HumanoidGaitPolicyLiteIsaaclab
 
 from ..state import SonicTeleopState
 
@@ -29,8 +31,24 @@ class ZeroLabArmPhase(str, Enum):
 
 
 class ZeroLabArmedTeleopState(SonicTeleopState):
-    def __init__(self, name, state_id, policy, *, arm_blend_seconds=2.0, **kwargs):
-        super().__init__(name, state_id, policy, **kwargs)
+    def __init__(
+        self,
+        name,
+        state_id,
+        policy,
+        *,
+        normal_policy: ResourceHandle[HumanoidGaitPolicyLiteIsaaclab],
+        arm_blend_seconds=2.0,
+        **kwargs,
+    ):
+        super().__init__(
+            name,
+            state_id,
+            policy,
+            additional_resources=(normal_policy,),
+            **kwargs,
+        )
+        self._normal_policy = normal_policy
         value = float(arm_blend_seconds)
         if not math.isfinite(value) or value <= 0.0:
             raise ValueError("arm_blend_seconds must be finite and positive")

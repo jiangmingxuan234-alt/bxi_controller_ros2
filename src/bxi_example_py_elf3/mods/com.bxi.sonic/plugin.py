@@ -5,6 +5,7 @@ from bxi_example_py_elf3.framework.mod_api import (
     ResourceLoadContext,
     StateBuildContext,
 )
+from bxi_example_py_elf3.policies import HumanoidGaitPolicyLiteIsaaclab
 
 from .policy import SonicTeleopPolicy
 from .state import DEFAULT_OPERATOR_PROMPT, SonicTeleopState
@@ -12,6 +13,9 @@ from .zerolab.state import ZeroLabArmedTeleopState
 
 
 SONIC_POLICY = ResourceKey[SonicTeleopPolicy]("com.bxi.sonic/policy")
+NORMAL_POLICY = ResourceKey[HumanoidGaitPolicyLiteIsaaclab](
+    "com.bxi.basic_actions/normal_policy"
+)
 
 
 def _load_policy(context: ResourceLoadContext) -> SonicTeleopPolicy:
@@ -130,11 +134,13 @@ def _build_state(
 def _build_zerolab_state(
     state: StateBuildContext,
     policy,
+    normal_policy,
 ) -> ZeroLabArmedTeleopState:
     return ZeroLabArmedTeleopState(
         state.name,
         state.state_id,
         policy,
+        normal_policy=normal_policy,
         arm_blend_seconds=state.float_param("arm_blend_seconds", 2.0),
         **_common_state_kwargs(state),
     )
@@ -143,12 +149,15 @@ def _build_zerolab_state(
 def create_mod(context: ModLoadContext) -> ModDefinition:
     context.register_resource(SONIC_POLICY, _load_policy, policy="startup")
     policy = context.resource(SONIC_POLICY)
+    normal_policy = context.resource(NORMAL_POLICY)
     return ModDefinition(
         state_factories={
             "sonic_teleop": lambda state: _build_state(state, policy),
-            "sonic_zerolab": lambda state: _build_zerolab_state(state, policy),
+            "sonic_zerolab": lambda state: _build_zerolab_state(
+                state, policy, normal_policy
+            ),
         }
     )
 
 
-__all__ = ["SONIC_POLICY", "create_mod"]
+__all__ = ["NORMAL_POLICY", "SONIC_POLICY", "create_mod"]
