@@ -548,7 +548,8 @@ reference 时进入。因为可用性检查发生在 state-scoped 节点 prepare
 cd /home/fazepurple/ros2_ws/bxi_rl_controller_ros2_example_dev/.worktrees/konodoki-dev
 source /opt/ros/humble/setup.bash
 source /home/fazepurple/ros2_ws/bxi_ros2_pkg/setup.bash
-source install/setup.bash
+source install-live-normal/setup.bash
+test "$(ros2 pkg prefix bxi_example_py_elf3)" = "$PWD/install-live-normal"
 export ROS_DOMAIN_ID=42
 ros2 launch bxi_example_py_elf3 example_demo.launch.py
 ```
@@ -559,7 +560,8 @@ ros2 launch bxi_example_py_elf3 example_demo.launch.py
 cd /home/fazepurple/ros2_ws/bxi_rl_controller_ros2_example_dev/.worktrees/konodoki-dev
 source /opt/ros/humble/setup.bash
 source /home/fazepurple/ros2_ws/bxi_ros2_pkg/setup.bash
-source install/setup.bash
+source install-live-normal/setup.bash
+test "$(ros2 pkg prefix bxi_example_py_elf3)" = "$PWD/install-live-normal"
 export ROS_DOMAIN_ID=42
 ```
 
@@ -578,12 +580,19 @@ ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{}'
 sleep 5
 ```
 
-进入 ZeroLab；此时机器人保持进入瞬间捕获的 normal 指令，不会立即接管人体目标：
+进入 ZeroLab；此时机器人由持续更新的零速度 Normal policy 平衡，不会立即接管人体目标：
 
 ```bash
 ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{btn_10: 11}'
 ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{}'
 sleep 1
+```
+
+```text
+btn_10=11 后，ZeroLab source/bridge 与 SONIC policy 在后台运行；电机输出由零速度 Normal policy 每周期更新，不是重复一张 Normal 快照。
+WAIT_CALIBRATION 和 WAIT_ARM 中的数据短停不会停止 Normal 平衡，也不会允许 SONIC 接管。
+首次 btn_10=12 在两秒内动态混合当前 Normal 与当前 SONIC 输出；ARMED 后停止 Normal inference。
+BLENDING/ARMED 断流仍冻结最后实际输出并取消 ARM；恢复后必须再次发送 btn_10=12，恢复 blend 从冻结帧开始。
 ```
 
 操作者再持续保持标准 T-pose，直到终端1显示 source、bridge 已就绪并进入
@@ -616,9 +625,11 @@ ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{}'
 ```
 
 ARM 后的两秒交接期间继续保持中立姿态。两秒 blend 可以减小指令跳变，但不能纠正错误的
-目标姿态。输入过期时机器人保持最后一帧指令并取消 ARM；新鲜输入恢复后仍需再次发送
-`btn_10=12`，系统不会自动进入 PD brake，也不会自动恢复人体控制。离开并重新进入 ZeroLab
-后，必须重新完成一次 T-pose 标定。
+目标姿态。输入过期时机器人保持最后一帧实际输出并取消 ARM；新鲜输入恢复后仍需从冻结帧
+再次发送 `btn_10=12`，系统不会自动进入 PD brake，也不会自动恢复人体控制。离开并重新
+进入 ZeroLab 后，必须重新完成一次 T-pose 标定。
+
+硬件测试仍然禁止，直到 Task 7 的每一项 MuJoCo acceptance item 全部通过。
 
 检查状态和三个监听端口：
 
