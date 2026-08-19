@@ -1,7 +1,7 @@
 # ZeroLab Live-Normal Safe Arming Design
 
 **Date:** 2026-08-19  
-**Status:** Awaiting written-spec review  
+**Status:** Approved for implementation planning
 **Supersedes:** The captured-Normal-frame waiting and fixed-start first-ARM blend
 defined in `2026-08-19-zerolab-safe-arming-design.md`
 
