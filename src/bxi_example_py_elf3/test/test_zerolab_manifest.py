@@ -61,13 +61,19 @@ def test_zerolab_event_state_and_routes_are_safe():
         "slot": "btn_10",
         "value": 11,
     }
+    assert manifest["events"]["arm_zerolab"] == {
+        "slot": "btn_10",
+        "value": 12,
+    }
     params = manifest["states"]["sonic_zerolab"]["params"]
     assert params["require_live_reference"] is False
     assert params["head_control_enabled"] is False
     assert params["hardware_gripper"] is False
     assert params["operator_prompt"] == (
-        "请保持T-pose，直到ZeroLab stream ready后再开始动作"
+        "T-pose标定期间机器人保持Normal；stream ready后回到中立姿势，"
+        "等待安全员发送btn_10=12"
     )
+    assert params["arm_blend_seconds"] == 2.0
     routes = {(r["from"], r["event"], r["to"]) for r in manifest["routes"]}
     assert (
         "com.bxi.basic_actions/normal",
@@ -86,6 +92,15 @@ def test_zerolab_event_state_and_routes_are_safe():
     assert not any(
         (route["from"], route["to"]) in forbidden
         for route in manifest["routes"]
+    )
+    actions = {
+        (item["from"], item["event"], item["action"])
+        for item in manifest["actions"]
+    }
+    assert ("sonic_zerolab", "arm_zerolab", "arm_zerolab") in actions
+    assert not any(
+        source == "sonic_teleop" and event == "arm_zerolab"
+        for source, event, _action in actions
     )
 
 
@@ -122,11 +137,15 @@ def test_source_prompts_and_zerolab_availability_without_live_data():
         pico_context = StateBuildContext("com.bxi.sonic/sonic_teleop", 1, {})
         pico = definition.state_factories["sonic_teleop"](pico_context)
         pico_context.finish()
+        assert type(pico).__name__ == "SonicTeleopState"
         assert pico.operator_prompt == (
             "PICO同时按住A+B+X+Y请求校准，再按A+X切入实时POSE"
         )
 
-        prompt = "请保持T-pose，直到ZeroLab stream ready后再开始动作"
+        prompt = (
+            "T-pose标定期间机器人保持Normal；stream ready后回到中立姿势，"
+            "等待安全员发送btn_10=12"
+        )
         zero_context = StateBuildContext(
             "com.bxi.sonic/sonic_zerolab",
             2,
@@ -135,10 +154,13 @@ def test_source_prompts_and_zerolab_availability_without_live_data():
                 "require_live_reference": False,
                 "head_control_enabled": False,
                 "hardware_gripper": False,
+                "arm_blend_seconds": 2.0,
             },
         )
         zero = definition.state_factories["sonic_zerolab"](zero_context)
         zero_context.finish()
+        assert type(zero).__name__ == "ZeroLabArmedTeleopState"
+        assert zero.arm_blend_seconds == 2.0
         assert zero._policy is pico._policy
         assert zero.require_live_reference is False
         assert zero.hardware_gripper is False
@@ -146,8 +168,10 @@ def test_source_prompts_and_zerolab_availability_without_live_data():
         logger = CaptureLogger()
         zero._bind_logger(logger)
         zero.on_enter(None)
+        zero.on_exit(None)
         assert logger.messages == [
-            "SONIC遥操已启动；头部跟踪已关闭；" + prompt
+            "SONIC遥操已启动；头部跟踪已关闭；" + prompt,
+            "ZeroLab ARM phase: WAIT_CALIBRATION",
         ]
     finally:
         resources.close()

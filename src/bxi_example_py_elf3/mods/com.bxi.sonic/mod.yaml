@@ -238,6 +238,9 @@ events:
   activate_zerolab:
     slot: btn_10
     value: 11
+  arm_zerolab:
+    slot: btn_10
+    value: 12
   reset_alignment:
     slot: btn_9
     value: 1
@@ -299,7 +302,9 @@ states:
       confirm: true
       confirm_message: 请先摆好T-pose；进入后保持不动，直到日志显示ZeroLab stream ready
     params:
-      operator_prompt: 请保持T-pose，直到ZeroLab stream ready后再开始动作
+      operator_prompt: >-
+        T-pose标定期间机器人保持Normal；stream ready后回到中立姿势，等待安全员发送btn_10=12
+      arm_blend_seconds: 2.0
       require_live_reference: false
       yaw_bias_rad: 1.57079632679
       live_reference_timeout_s: 0.5
@@ -353,3 +358,9 @@ actions:
     manifest:
       label: 重置朝向对齐
       ui: refresh
+  - from: sonic_zerolab
+    event: arm_zerolab
+    action: arm_zerolab
+    manifest:
+      label: ZeroLab ARM
+      ui: shield
