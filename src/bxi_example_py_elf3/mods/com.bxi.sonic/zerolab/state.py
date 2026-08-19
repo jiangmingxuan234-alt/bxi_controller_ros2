@@ -177,6 +177,26 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
         natural = self._motor_frame_from_target(ctx, output.joints)
         return ctx.resolve_motor_frame(natural, self._normal_frame)
 
+    def _normal_balance_active(self) -> bool:
+        return self._arm_phase in (
+            ZeroLabArmPhase.WAIT_CALIBRATION,
+            ZeroLabArmPhase.WAIT_ARM,
+        ) or (
+            self._arm_phase is ZeroLabArmPhase.BLENDING
+            and self._blend_source is ZeroLabBlendSource.LIVE_NORMAL
+        )
+
+    def on_update(self, ctx: RobotControlContext, dt: float) -> None:
+        if self._normal_balance_active() and ctx.is_orientation_unsafe(
+            ctx.current_quat_xyzw
+        ):
+            ctx.request_state(
+                "com.bxi.basic_actions/zero_torque",
+                trigger="safety",
+            )
+            return
+        super().on_update(ctx, dt)
+
     def sample_running_frame(
         self,
         ctx: RobotControlContext,

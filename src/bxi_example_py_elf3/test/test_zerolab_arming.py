@@ -116,6 +116,16 @@ class FakeContext:
         self.speed_profiles = {}
         self.inference_frame = FakeInferenceFrame(self.current_cmd_vel)
         self.applied = None
+        self.current_quat_xyzw = np.array([0.0, 0.0, 0.0, 1.0])
+        self.orientation_unsafe = False
+        self.requested_states = []
+
+    def is_orientation_unsafe(self, _quat):
+        return self.orientation_unsafe
+
+    def request_state(self, name, *, trigger):
+        self.requested_states.append((name, trigger))
+        return True
 
     def resolve_motor_frame(self, frame, output):
         assert frame.layout == self.robot_layout
@@ -395,6 +405,50 @@ def test_wait_arm_stale_gap_continues_live_normal():
     assert state.arm_phase is ZeroLabArmPhase.WAIT_ARM
     np.testing.assert_allclose(frame.qpos, 0.6)
     assert normal.step_calls >= 2
+
+
+@pytest.mark.parametrize(
+    "phase_name",
+    ["wait_calibration", "wait_arm", "initial_blend"],
+)
+def test_live_normal_phases_keep_normal_orientation_safety(phase_name):
+    if phase_name == "wait_calibration":
+        state, sonic, normal, ctx = prepared_state()
+    else:
+        state, sonic, normal, ctx = waiting_arm_state()
+    if phase_name == "initial_blend":
+        state.on_action(ctx, "arm_zerolab")
+    ctx.orientation_unsafe = True
+
+    state.on_update(ctx, 0.02)
+
+    assert ctx.requested_states == [
+        ("com.bxi.basic_actions/zero_torque", "safety")
+    ]
+    assert ctx.applied is None
+
+
+def test_fully_armed_keeps_existing_sonic_orientation_behavior():
+    state, sonic, normal, ctx = fully_armed_state()
+    ctx.orientation_unsafe = True
+
+    state.on_update(ctx, 0.02)
+
+    assert ctx.requested_states == []
+    assert ctx.applied is not None
+
+
+def test_frozen_recovery_blend_keeps_existing_sonic_orientation_behavior():
+    state, sonic, normal, ctx = stale_hold_state()
+    sonic.fresh = True
+    state.on_action(ctx, "arm_zerolab")
+    ctx.orientation_unsafe = True
+
+    state.on_update(ctx, 0.02)
+
+    assert state._blend_source is arming_module.ZeroLabBlendSource.FROZEN
+    assert ctx.requested_states == []
+    assert ctx.applied is not None
 
 
 def test_exit_clears_arm_session_and_next_prepare_requires_calibration():
