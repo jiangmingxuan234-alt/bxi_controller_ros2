@@ -57,6 +57,7 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
         self._hold_frame = None
         self._applied_frame = None
         self._live_frame = None
+        self._normal_frame = None
         self._blend_start_frame = None
         self._blend_elapsed_s = 0.0
         self._recovery_notice_logged = False
@@ -101,6 +102,7 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
         self._hold_frame = MotorFrame.empty(ctx.robot_layout)
         self._applied_frame = MotorFrame.empty(ctx.robot_layout)
         self._live_frame = MotorFrame.empty(ctx.robot_layout)
+        self._normal_frame = MotorFrame.empty(ctx.robot_layout)
         self._blend_start_frame = MotorFrame.empty(ctx.robot_layout)
         self._copy_frame(self._hold_frame, ctx.last_motor_frame)
         self._copy_frame(self._applied_frame, ctx.last_motor_frame)
@@ -109,6 +111,9 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
         self._set_phase(
             ZeroLabArmPhase.WAIT_CALIBRATION,
             "ZeroLab ARM phase: WAIT_CALIBRATION",
+        )
+        self.logger.info(
+            "ZeroLab pre-ARM output: live zero-command Normal policy"
         )
 
     def get_entry_frame(self, ctx: RobotControlContext) -> MotorFrame:
@@ -130,6 +135,17 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
             ZeroLabArmPhase.BLENDING,
             f"ZeroLab ARM accepted; blending for {self.arm_blend_seconds:.3f} s",
         )
+
+    def _sample_normal_frame(self, ctx, dt, *, advance):
+        assert self._normal_frame is not None
+        self.get_cmd_vel(ctx)
+        output = self._normal_policy.get().step(
+            ctx.inference_frame,
+            dt,
+            advance=advance,
+        )
+        natural = self._motor_frame_from_target(ctx, output.joints)
+        return ctx.resolve_motor_frame(natural, self._normal_frame)
 
     def sample_running_frame(
         self,
@@ -227,7 +243,13 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
         if self._arm_phase is ZeroLabArmPhase.ARMED:
             return self._copy_frame(self._applied_frame, self._live_frame)
 
-        self._copy_frame(self._applied_frame, self._hold_frame)
+        if self._arm_phase in (
+            ZeroLabArmPhase.WAIT_CALIBRATION,
+            ZeroLabArmPhase.WAIT_ARM,
+        ):
+            normal = self._sample_normal_frame(ctx, dt, advance=True)
+            return self._copy_frame(self._applied_frame, normal)
+
         return self._applied_frame
 
     def on_exit(self, ctx: RobotControlContext) -> None:
@@ -239,6 +261,7 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
         self._hold_frame = None
         self._applied_frame = None
         self._live_frame = None
+        self._normal_frame = None
         self._blend_start_frame = None
         self._blend_elapsed_s = 0.0
         self._recovery_notice_logged = False

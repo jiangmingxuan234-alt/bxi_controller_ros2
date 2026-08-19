@@ -77,6 +77,21 @@ class FakePolicy:
         pass
 
 
+class FakeNormalPolicy:
+    def __init__(self):
+        target = JointTargetBuffer(ELF3_POLICY_JOINTS)
+        target.kp.fill(40.0)
+        target.kd.fill(2.0)
+        self.output = PolicyOutput(target.view)
+        self.target = target
+        self.step_calls = 0
+
+    def step(self, _frame, _dt, *, advance=True):
+        if advance:
+            self.step_calls += 1
+        return self.output
+
+
 class FakeHandle:
     status = "ready"
 
@@ -87,11 +102,19 @@ class FakeHandle:
         return self.policy
 
 
+class FakeInferenceFrame:
+    def __init__(self, command):
+        self.command = command
+
+
 class FakeContext:
     def __init__(self, last_motor_frame):
         self.robot_layout = ELF3_POLICY_JOINTS
         self.last_motor_frame = last_motor_frame
-        self.inference_frame = object()
+        self.current_raw_cmd_vel = np.array([0.8, -0.4, 0.6], dtype=np.float32)
+        self.current_cmd_vel = np.zeros(3, dtype=np.float32)
+        self.speed_profiles = {}
+        self.inference_frame = FakeInferenceFrame(self.current_cmd_vel)
         self.applied = None
 
     def resolve_motor_frame(self, frame, output):
@@ -124,6 +147,7 @@ class CaptureLogger:
 
 def make_state(*, entry_value=0.0, arm_blend_seconds=2.0):
     policy = FakePolicy()
+    normal_policy = FakeNormalPolicy()
     entry = MotorFrame.create(
         ELF3_POLICY_JOINTS,
         np.full(ELF3_POLICY_JOINTS.dof_num, entry_value, dtype=np.float32),
@@ -137,68 +161,69 @@ def make_state(*, entry_value=0.0, arm_blend_seconds=2.0):
         "zerolab",
         1,
         FakeHandle(policy),
+        normal_policy=FakeHandle(normal_policy),
         head_control_enabled=False,
         hardware_gripper=False,
         live_reference_timeout_s=0.5,
         arm_blend_seconds=arm_blend_seconds,
     )
     state._bind_logger(CaptureLogger())
-    return state, policy, ctx
+    return state, policy, normal_policy, ctx
 
 
 def prepared_state(*, entry_value=0.0, arm_blend_seconds=2.0):
-    state, policy, ctx = make_state(
+    state, sonic, normal, ctx = make_state(
         entry_value=entry_value,
         arm_blend_seconds=arm_blend_seconds,
     )
     state.on_prepare(ctx, object())
-    return state, policy, ctx
+    return state, sonic, normal, ctx
 
 
 def armed_state_at_half_blend():
-    state, policy, ctx = prepared_state(entry_value=0.0)
-    policy.fresh = True
+    state, sonic, normal, ctx = prepared_state(entry_value=0.0)
+    sonic.fresh = True
     state.sample_running_frame(ctx, 0.02, advance=True)
     assert state.on_action(ctx, "arm_zerolab") is True
-    policy.target.position.fill(2.0)
-    policy.target.kp.fill(80.0)
-    policy.target.kd.fill(4.0)
+    sonic.target.position.fill(2.0)
+    sonic.target.kp.fill(80.0)
+    sonic.target.kd.fill(4.0)
     state.sample_running_frame(ctx, 1.0, advance=True)
-    return state, policy, ctx
+    return state, sonic, normal, ctx
 
 
 def fully_armed_state():
-    state, policy, ctx = prepared_state(entry_value=0.0)
-    policy.fresh = True
+    state, sonic, normal, ctx = prepared_state(entry_value=0.0)
+    sonic.fresh = True
     state.sample_running_frame(ctx, 0.02, advance=True)
     assert state.on_action(ctx, "arm_zerolab") is True
-    policy.target.position.fill(2.0)
+    sonic.target.position.fill(2.0)
     state.sample_running_frame(ctx, 2.0, advance=True)
     assert state.arm_phase is ZeroLabArmPhase.ARMED
-    return state, policy, ctx
+    return state, sonic, normal, ctx
 
 
 def state_in_active_phase(phase):
-    state, policy, ctx = fully_armed_state()
+    state, sonic, normal, ctx = fully_armed_state()
     if phase is ZeroLabArmPhase.BLENDING:
-        state, policy, ctx = armed_state_at_half_blend()
-    return state, policy, ctx
+        state, sonic, normal, ctx = armed_state_at_half_blend()
+    return state, sonic, normal, ctx
 
 
 def stale_hold_state():
-    state, policy, ctx = fully_armed_state()
-    policy.fresh = False
+    state, sonic, normal, ctx = fully_armed_state()
+    sonic.fresh = False
     state.sample_running_frame(ctx, 0.02, advance=True)
     assert state.arm_phase is ZeroLabArmPhase.HOLD_STALE
-    return state, policy, ctx
+    return state, sonic, normal, ctx
 
 
 def waiting_arm_state():
-    state, policy, ctx = prepared_state(entry_value=0.0)
-    policy.fresh = True
+    state, sonic, normal, ctx = prepared_state(entry_value=0.0)
+    sonic.fresh = True
     state.sample_running_frame(ctx, 0.02, advance=True)
     assert state.arm_phase is ZeroLabArmPhase.WAIT_ARM
-    return state, policy, ctx
+    return state, sonic, normal, ctx
 
 
 def copy_motor_frame(frame):
@@ -226,21 +251,25 @@ def test_arm_blend_seconds_must_be_finite_and_positive():
             make_state(arm_blend_seconds=value)
 
 
-def test_prepare_deep_copies_entry_frame_and_waiting_advances_policy():
-    state, policy, ctx = prepared_state(entry_value=0.25)
-    ctx.last_motor_frame.qpos.fill(9.0)
-    policy.target.position.fill(1.0)
+def test_waiting_applies_changing_live_normal_with_zero_command():
+    state, sonic, normal, ctx = prepared_state(entry_value=0.25)
+    normal.target.position.fill(0.4)
 
-    frame = state.sample_running_frame(ctx, 0.02, advance=True)
+    first = copy_motor_frame(state.sample_running_frame(ctx, 0.02, advance=True))
+    normal.target.position.fill(0.7)
+    second = copy_motor_frame(state.sample_running_frame(ctx, 0.02, advance=True))
 
     assert state.arm_phase is ZeroLabArmPhase.WAIT_CALIBRATION
-    assert policy.step_calls == 1
-    np.testing.assert_allclose(frame.qpos, 0.25)
+    np.testing.assert_allclose(first.qpos, 0.4)
+    np.testing.assert_allclose(second.qpos, 0.7)
+    np.testing.assert_allclose(ctx.inference_frame.command, 0.0)
+    assert sonic.step_calls == 2
+    assert normal.step_calls == 2
     np.testing.assert_allclose(state.get_entry_frame(ctx).qpos, 0.25)
 
 
 def test_prepare_logs_initial_wait_calibration_phase_once():
-    state, _policy, ctx = prepared_state(entry_value=0.0)
+    state, _sonic, _normal, ctx = prepared_state(entry_value=0.0)
     state.on_prepare(ctx, object())
 
     messages = [
@@ -251,31 +280,29 @@ def test_prepare_logs_initial_wait_calibration_phase_once():
 
 
 def test_fresh_reference_waits_for_explicit_arm():
-    state, policy, ctx = prepared_state(entry_value=0.25)
-    policy.fresh = True
-    policy.target.position.fill(1.0)
+    state, sonic, normal, ctx = prepared_state(entry_value=0.25)
+    sonic.fresh = True
+    sonic.target.position.fill(1.0)
 
     frame = state.sample_running_frame(ctx, 0.02, advance=True)
 
     assert state.arm_phase is ZeroLabArmPhase.WAIT_ARM
-    np.testing.assert_allclose(frame.qpos, 0.25)
+    np.testing.assert_allclose(frame.qpos, 0.0)
 
 
 def test_arm_is_rejected_until_fresh_reference_exists():
-    state, policy, ctx = prepared_state(entry_value=0.0)
+    state, sonic, normal, ctx = prepared_state(entry_value=0.0)
     assert state.on_action(ctx, "arm_zerolab") is True
     assert state.arm_phase is ZeroLabArmPhase.WAIT_CALIBRATION
 
 
-def test_arm_blends_all_motor_fields_for_exactly_two_seconds():
-    state, policy, ctx = prepared_state(entry_value=0.0)
-    policy.fresh = True
+def test_first_arm_snapshot_blend_still_completes_two_seconds():
+    state, sonic, normal, ctx = prepared_state(entry_value=0.0)
+    sonic.fresh = True
     state.sample_running_frame(ctx, 0.02, advance=True)
     assert state.on_action(ctx, "arm_zerolab") is True
 
-    policy.target.position.fill(2.0)
-    policy.target.kp.fill(80.0)
-    policy.target.kd.fill(4.0)
+    sonic.target.position.fill(2.0)
     first = copy_motor_frame(state.sample_running_frame(ctx, 0.0, advance=True))
     middle = copy_motor_frame(state.sample_running_frame(ctx, 1.0, advance=True))
     final = copy_motor_frame(state.sample_running_frame(ctx, 1.0, advance=True))
@@ -283,15 +310,11 @@ def test_arm_blends_all_motor_fields_for_exactly_two_seconds():
     np.testing.assert_allclose(first.qpos, 0.0)
     np.testing.assert_allclose(middle.qpos, 1.0)
     np.testing.assert_allclose(final.qpos, 2.0)
-    np.testing.assert_allclose(middle.kp, 60.0)
-    np.testing.assert_allclose(middle.kd, 3.0)
-    np.testing.assert_allclose(middle.vel, 0.2)
-    np.testing.assert_allclose(middle.torque, 0.4)
     assert state.arm_phase is ZeroLabArmPhase.ARMED
 
 
 def test_duplicate_arm_does_not_restart_blend():
-    state, policy, ctx = armed_state_at_half_blend()
+    state, sonic, normal, ctx = armed_state_at_half_blend()
     before = state._blend_elapsed_s
     assert state.on_action(ctx, "arm_zerolab") is True
     assert state._blend_elapsed_s == before
@@ -303,10 +326,10 @@ def test_duplicate_arm_does_not_restart_blend():
     ZeroLabArmPhase.ARMED,
 ])
 def test_stale_reference_freezes_last_applied_frame_and_cancels_arm(starting_phase):
-    state, policy, ctx = state_in_active_phase(starting_phase)
+    state, sonic, normal, ctx = state_in_active_phase(starting_phase)
     before = copy_motor_frame(state.sample_running_frame(ctx, 0.02, advance=True))
-    policy.fresh = False
-    policy.target.position.fill(9.0)
+    sonic.fresh = False
+    sonic.target.position.fill(9.0)
 
     after = state.sample_running_frame(ctx, 0.02, advance=True)
 
@@ -315,10 +338,10 @@ def test_stale_reference_freezes_last_applied_frame_and_cancels_arm(starting_pha
 
 
 def test_recovery_does_not_resume_until_rearmed():
-    state, policy, ctx = stale_hold_state()
+    state, sonic, normal, ctx = stale_hold_state()
     frozen = copy_motor_frame(state.sample_running_frame(ctx, 0.02, advance=True))
-    policy.fresh = True
-    policy.target.position.fill(2.0)
+    sonic.fresh = True
+    sonic.target.position.fill(2.0)
 
     waiting = state.sample_running_frame(ctx, 0.02, advance=True)
     assert state.arm_phase is ZeroLabArmPhase.HOLD_STALE
@@ -330,29 +353,33 @@ def test_recovery_does_not_resume_until_rearmed():
     assert_motor_frames_equal(resumed, frozen)
 
 
-def test_wait_arm_gap_never_changes_held_normal_frame():
-    state, policy, ctx = waiting_arm_state()
-    policy.fresh = False
+def test_wait_arm_stale_gap_continues_live_normal():
+    state, sonic, normal, ctx = waiting_arm_state()
+    sonic.fresh = False
+    normal.target.position.fill(0.6)
+
     frame = state.sample_running_frame(ctx, 1.0, advance=True)
+
     assert state.arm_phase is ZeroLabArmPhase.WAIT_ARM
-    assert_motor_frames_equal(frame, state.get_entry_frame(ctx))
+    np.testing.assert_allclose(frame.qpos, 0.6)
+    assert normal.step_calls >= 2
 
 
 def test_exit_clears_arm_session_and_next_prepare_requires_calibration():
-    state, policy, ctx = fully_armed_state()
+    state, sonic, normal, ctx = fully_armed_state()
     state.on_exit(ctx)
-    policy.fresh = False
+    sonic.fresh = False
     state.on_prepare(ctx, SimpleNamespace())
     assert state.arm_phase is ZeroLabArmPhase.WAIT_CALIBRATION
 
 
 def test_stale_and_recovery_logs_are_emitted_once_per_stale_session():
-    state, policy, ctx = fully_armed_state()
+    state, sonic, normal, ctx = fully_armed_state()
     logger = state.logger
-    policy.fresh = False
+    sonic.fresh = False
     for _ in range(100):
         state.sample_running_frame(ctx, 0.02, advance=True)
-    policy.fresh = True
+    sonic.fresh = True
     for _ in range(100):
         state.sample_running_frame(ctx, 0.02, advance=True)
 

@@ -236,6 +236,7 @@ def test_source_prompts_and_zerolab_availability_without_live_data():
         zero.on_enter(None)
         assert logger.messages == [
             "ZeroLab ARM phase: WAIT_CALIBRATION",
+            "ZeroLab pre-ARM output: live zero-command Normal policy",
             "SONIC遥操已启动；头部跟踪已关闭；" + prompt,
         ]
     finally:
