@@ -239,6 +239,17 @@ def test_prepare_deep_copies_entry_frame_and_waiting_advances_policy():
     np.testing.assert_allclose(state.get_entry_frame(ctx).qpos, 0.25)
 
 
+def test_prepare_logs_initial_wait_calibration_phase_once():
+    state, _policy, ctx = prepared_state(entry_value=0.0)
+    state.on_prepare(ctx, object())
+
+    messages = [
+        message for _level, message in state.logger.messages
+        if "ZeroLab ARM phase: WAIT_CALIBRATION" in message
+    ]
+    assert messages == ["ZeroLab ARM phase: WAIT_CALIBRATION"]
+
+
 def test_fresh_reference_waits_for_explicit_arm():
     state, policy, ctx = prepared_state(entry_value=0.25)
     policy.fresh = True

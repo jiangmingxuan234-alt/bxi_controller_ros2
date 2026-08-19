@@ -42,6 +42,7 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
         self._blend_start_frame = None
         self._blend_elapsed_s = 0.0
         self._recovery_notice_logged = False
+        self._phase_logged = False
 
     @property
     def arm_phase(self) -> ZeroLabArmPhase:
@@ -64,9 +65,10 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
         *,
         warning: bool = False,
     ) -> None:
-        if phase is self._arm_phase:
+        if phase is self._arm_phase and self._phase_logged:
             return
         self._arm_phase = phase
+        self._phase_logged = True
         if warning:
             self.logger.warning(message)
         else:
