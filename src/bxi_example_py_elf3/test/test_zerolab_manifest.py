@@ -1,8 +1,12 @@
 from pathlib import Path
 
+import numpy as np
 import yaml
 
+from bxi_example_py_elf3.framework.inference import PolicyOutput
+from bxi_example_py_elf3.framework.joints import JointTargetBuffer
 from bxi_example_py_elf3.framework.mod_api import ResourceKey, StateBuildContext
+from bxi_example_py_elf3.framework.mod_api.transition import MotorFrame
 from bxi_example_py_elf3.framework.runtime.mod_loader import (
     _discover_mods,
     _load_definition,
@@ -12,6 +16,7 @@ from bxi_example_py_elf3.framework.runtime.mod_loader import (
 from bxi_example_py_elf3.framework.runtime.resource_manager import (
     ResourceManager,
 )
+from bxi_example_py_elf3.policies.joints import ELF3_POLICY_JOINTS
 
 
 MOD_ROOT = Path(__file__).resolve().parents[1] / "mods" / "com.bxi.sonic"
@@ -118,6 +123,43 @@ class CaptureLogger:
         pass
 
 
+class EntryLifecyclePolicy:
+    def __init__(self):
+        target = JointTargetBuffer(ELF3_POLICY_JOINTS)
+        self.output = PolicyOutput(target.view)
+        self.head_joint_target = np.zeros(2, dtype=np.float32)
+
+    def bind_logger(self, _logger):
+        pass
+
+    def configure_runtime(self, **_kwargs):
+        pass
+
+    def reset(self, _frame=None):
+        pass
+
+    def has_fresh_live_reference(self, _timeout_s=None):
+        return False
+
+
+class EntryLifecycleHandle:
+    status = "ready"
+
+    def __init__(self):
+        self.policy = EntryLifecyclePolicy()
+
+    def get(self):
+        return self.policy
+
+
+class EntryLifecycleContext:
+    robot_layout = ELF3_POLICY_JOINTS
+    inference_frame = None
+
+    def __init__(self):
+        self.last_motor_frame = MotorFrame.empty(self.robot_layout)
+
+
 def test_source_prompts_and_zerolab_availability_without_live_data():
     resources = ResourceManager()
     module_prefix = None
@@ -167,11 +209,12 @@ def test_source_prompts_and_zerolab_availability_without_live_data():
         assert zero.is_available(None) is True
         logger = CaptureLogger()
         zero._bind_logger(logger)
+        zero._policy = EntryLifecycleHandle()
+        zero.on_prepare(EntryLifecycleContext(), object())
         zero.on_enter(None)
-        zero.on_exit(None)
         assert logger.messages == [
-            "SONIC遥操已启动；头部跟踪已关闭；" + prompt,
             "ZeroLab ARM phase: WAIT_CALIBRATION",
+            "SONIC遥操已启动；头部跟踪已关闭；" + prompt,
         ]
     finally:
         resources.close()
