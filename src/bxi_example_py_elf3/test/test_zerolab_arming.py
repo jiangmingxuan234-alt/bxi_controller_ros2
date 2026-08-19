@@ -237,6 +237,19 @@ def copy_motor_frame(frame):
     )
 
 
+def full_motor_frame(*, qpos, kp, kd, vel, torque):
+    size = ELF3_POLICY_JOINTS.dof_num
+    values = lambda value: np.full(size, value, dtype=np.float32)
+    return MotorFrame.create(
+        ELF3_POLICY_JOINTS,
+        values(qpos),
+        values(kp),
+        values(kd),
+        vel=values(vel),
+        torque=values(torque),
+    )
+
+
 def assert_motor_frames_equal(actual, expected):
     np.testing.assert_allclose(actual.qpos, expected.qpos)
     np.testing.assert_allclose(actual.kp, expected.kp)
@@ -296,21 +309,40 @@ def test_arm_is_rejected_until_fresh_reference_exists():
     assert state.arm_phase is ZeroLabArmPhase.WAIT_CALIBRATION
 
 
-def test_first_arm_snapshot_blend_still_completes_two_seconds():
-    state, sonic, normal, ctx = prepared_state(entry_value=0.0)
-    sonic.fresh = True
-    state.sample_running_frame(ctx, 0.02, advance=True)
-    assert state.on_action(ctx, "arm_zerolab") is True
-
+def test_first_arm_blends_current_normal_and_current_sonic():
+    state, sonic, normal, ctx = waiting_arm_state()
+    normal.target.position.fill(0.5)
     sonic.target.position.fill(2.0)
+    state.on_action(ctx, "arm_zerolab")
+
+    normal.target.position.fill(1.0)
     first = copy_motor_frame(state.sample_running_frame(ctx, 0.0, advance=True))
+    normal.target.position.fill(1.2)
     middle = copy_motor_frame(state.sample_running_frame(ctx, 1.0, advance=True))
     final = copy_motor_frame(state.sample_running_frame(ctx, 1.0, advance=True))
 
-    np.testing.assert_allclose(first.qpos, 0.0)
-    np.testing.assert_allclose(middle.qpos, 1.0)
+    np.testing.assert_allclose(first.qpos, 1.0)
+    np.testing.assert_allclose(middle.qpos, 1.6)
     np.testing.assert_allclose(final.qpos, 2.0)
     assert state.arm_phase is ZeroLabArmPhase.ARMED
+
+    normal_calls = normal.step_calls
+    state.sample_running_frame(ctx, 0.02, advance=True)
+    assert normal.step_calls == normal_calls
+
+
+def test_blend_frames_interpolates_all_complete_motor_fields():
+    source = full_motor_frame(qpos=0.0, kp=10.0, kd=1.0, vel=2.0, torque=3.0)
+    target = full_motor_frame(qpos=2.0, kp=30.0, kd=5.0, vel=6.0, torque=7.0)
+    output = MotorFrame.empty(ELF3_POLICY_JOINTS)
+
+    ZeroLabArmedTeleopState._blend_frames(source, target, output, 0.5)
+
+    np.testing.assert_allclose(output.qpos, 1.0)
+    np.testing.assert_allclose(output.kp, 20.0)
+    np.testing.assert_allclose(output.kd, 3.0)
+    np.testing.assert_allclose(output.vel, 4.0)
+    np.testing.assert_allclose(output.torque, 5.0)
 
 
 def test_duplicate_arm_does_not_restart_blend():

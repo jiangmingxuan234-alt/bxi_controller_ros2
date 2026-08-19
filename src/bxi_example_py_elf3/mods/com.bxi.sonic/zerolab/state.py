@@ -30,6 +30,11 @@ class ZeroLabArmPhase(str, Enum):
     HOLD_STALE = "hold_stale"
 
 
+class ZeroLabBlendSource(str, Enum):
+    LIVE_NORMAL = "live_normal"
+    FROZEN = "frozen"
+
+
 class ZeroLabArmedTeleopState(SonicTeleopState):
     def __init__(
         self,
@@ -59,6 +64,7 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
         self._live_frame = None
         self._normal_frame = None
         self._blend_start_frame = None
+        self._blend_source = ZeroLabBlendSource.LIVE_NORMAL
         self._blend_elapsed_s = 0.0
         self._recovery_notice_logged = False
         self._phase_logged = False
@@ -106,6 +112,7 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
         self._blend_start_frame = MotorFrame.empty(ctx.robot_layout)
         self._copy_frame(self._hold_frame, ctx.last_motor_frame)
         self._copy_frame(self._applied_frame, ctx.last_motor_frame)
+        self._blend_source = ZeroLabBlendSource.LIVE_NORMAL
         self._blend_elapsed_s = 0.0
         self._recovery_notice_logged = False
         self._set_phase(
@@ -126,14 +133,37 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
         p = min(max(float(progress), 0.0), 1.0)
         return p * p * (3.0 - 2.0 * p)
 
+    @staticmethod
+    def _blend_frames(source, target, output, alpha):
+        for start, end, destination in (
+            (source.qpos, target.qpos, output.qpos),
+            (source.kp, target.kp, output.kp),
+            (source.kd, target.kd, output.kd),
+            (source.vel, target.vel, output.vel),
+            (source.torque, target.torque, output.torque),
+        ):
+            np.subtract(end, start, out=destination)
+            destination *= alpha
+            destination += start
+        return output
+
     def _begin_blend(self) -> None:
         assert self._blend_start_frame is not None
         assert self._applied_frame is not None
-        self._copy_frame(self._blend_start_frame, self._applied_frame)
+        initial_arm = self._arm_phase is ZeroLabArmPhase.WAIT_ARM
+        self._blend_source = (
+            ZeroLabBlendSource.LIVE_NORMAL
+            if initial_arm
+            else ZeroLabBlendSource.FROZEN
+        )
+        if not initial_arm:
+            self._copy_frame(self._blend_start_frame, self._applied_frame)
         self._blend_elapsed_s = 0.0
         self._set_phase(
             ZeroLabArmPhase.BLENDING,
-            f"ZeroLab ARM accepted; blending for {self.arm_blend_seconds:.3f} s",
+            "ZeroLab ARM accepted; blending "
+            f"{'live Normal' if initial_arm else 'frozen frame'} -> SONIC "
+            f"for {self.arm_blend_seconds:.3f} s",
         )
 
     def _sample_normal_frame(self, ctx, dt, *, advance):
@@ -203,36 +233,18 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
             alpha = self._smoothstep(
                 self._blend_elapsed_s / self.arm_blend_seconds
             )
-            for target, start, output in (
-                (
-                    self._live_frame.qpos,
-                    self._blend_start_frame.qpos,
-                    self._applied_frame.qpos,
-                ),
-                (
-                    self._live_frame.kp,
-                    self._blend_start_frame.kp,
-                    self._applied_frame.kp,
-                ),
-                (
-                    self._live_frame.kd,
-                    self._blend_start_frame.kd,
-                    self._applied_frame.kd,
-                ),
-                (
-                    self._live_frame.vel,
-                    self._blend_start_frame.vel,
-                    self._applied_frame.vel,
-                ),
-                (
-                    self._live_frame.torque,
-                    self._blend_start_frame.torque,
-                    self._applied_frame.torque,
-                ),
-            ):
-                np.subtract(target, start, out=output)
-                output *= alpha
-                output += start
+            if self._blend_source is ZeroLabBlendSource.LIVE_NORMAL:
+                blend_source = self._sample_normal_frame(
+                    ctx, dt, advance=True
+                )
+            else:
+                blend_source = self._blend_start_frame
+            self._blend_frames(
+                blend_source,
+                self._live_frame,
+                self._applied_frame,
+                alpha,
+            )
             if self._blend_elapsed_s >= self.arm_blend_seconds:
                 self._set_phase(
                     ZeroLabArmPhase.ARMED,
@@ -263,6 +275,7 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
         self._live_frame = None
         self._normal_frame = None
         self._blend_start_frame = None
+        self._blend_source = ZeroLabBlendSource.LIVE_NORMAL
         self._blend_elapsed_s = 0.0
         self._recovery_notice_logged = False
 
@@ -287,4 +300,9 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
         return True
 
 
-__all__ = ["ARM_ACTION", "ZeroLabArmPhase", "ZeroLabArmedTeleopState"]
+__all__ = [
+    "ARM_ACTION",
+    "ZeroLabArmPhase",
+    "ZeroLabBlendSource",
+    "ZeroLabArmedTeleopState",
+]
