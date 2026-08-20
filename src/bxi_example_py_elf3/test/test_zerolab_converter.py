@@ -6,10 +6,8 @@ import zerolab.converter as converter_module
 from zerolab.converter import (
     BODY_JOINT_COUNT,
     SMPL24_PARENTS,
-    TPoseCalibrator,
     ZeroLabMotionConverter,
     align_quaternion_signs,
-    apply_rest_alignment,
     synthesize_smpl_world_quats,
     unity_world_quaternions_to_xrt,
 )
@@ -83,118 +81,6 @@ def test_quaternion_sign_flip_is_continuous():
     aligned = align_quaternion_signs(current, previous)
 
     np.testing.assert_array_equal(aligned, previous)
-    assert aligned.dtype == np.float32
-
-
-def test_stable_t_pose_completes_on_frame_100():
-    calibrator = TPoseCalibrator()
-    for index in range(99):
-        frame = identity_body() if index % 2 == 0 else -identity_body()
-        assert calibrator.observe(frame) is False
-        assert calibrator.frames_collected == index + 1
-
-    assert calibrator.observe(-identity_body()) is True
-    assert calibrator.is_calibrated
-    np.testing.assert_allclose(
-        calibrator.rest_quats_xyzw, identity_body(), atol=1e-7
-    )
-    assert calibrator.rest_quats_xyzw.dtype == np.float32
-
-
-def test_motion_over_five_degrees_restarts_calibration_window():
-    calibrator = TPoseCalibrator(required_frames=4, max_deviation_degrees=5.0)
-    for _ in range(3):
-        calibrator.observe(identity_body())
-    moved = identity_body()
-    moved[4] = Rotation.from_euler("x", 10.0, degrees=True).as_quat()
-
-    assert calibrator.observe(moved) is False
-    assert calibrator.frames_collected == 1
-
-
-def test_motion_at_five_degrees_stays_in_calibration_window():
-    boundary = identity_body()
-    boundary[4] = Rotation.from_euler("x", 10.0, degrees=True).as_quat()
-    normalized = boundary.astype(np.float64)
-    normalized /= np.linalg.norm(normalized, axis=1, keepdims=True)
-    normalized = normalized.astype(np.float32)
-    expected_mean = Rotation.from_euler(
-        "x", 5.0, degrees=True
-    ).as_quat().astype(np.float32)
-    endpoint_dots = np.array(
-        [normalized[0] @ expected_mean, normalized[4] @ expected_mean]
-    )
-    boundary_angle = np.max(
-        np.degrees(
-            2.0 * np.arccos(np.clip(np.abs(endpoint_dots), 0.0, 1.0))
-        )
-    )
-    calibrator = TPoseCalibrator(
-        required_frames=3,
-        max_deviation_degrees=float(boundary_angle),
-    )
-    calibrator.observe(identity_body())
-
-    assert calibrator.observe(boundary) is False
-    assert calibrator.frames_collected == 2
-
-
-def test_motion_is_compared_to_every_frame_in_candidate_window():
-    calibrator = TPoseCalibrator(required_frames=5, max_deviation_degrees=5.0)
-    calibrator.observe(identity_body())
-    four_degrees = identity_body()
-    four_degrees[4] = Rotation.from_euler("x", 4.0, degrees=True).as_quat()
-    eight_degrees = identity_body()
-    eight_degrees[4] = Rotation.from_euler("x", 8.0, degrees=True).as_quat()
-    ten_degrees = identity_body()
-    ten_degrees[4] = Rotation.from_euler("x", 10.0, degrees=True).as_quat()
-
-    assert calibrator.observe(four_degrees) is False
-    assert calibrator.frames_collected == 2
-    assert calibrator.observe(eight_degrees) is False
-    assert calibrator.frames_collected == 3
-    assert calibrator.observe(ten_degrees) is False
-    assert calibrator.frames_collected == 1
-
-
-def test_gradual_motion_cannot_chase_the_calibration_window_mean():
-    calibrator = TPoseCalibrator(
-        required_frames=5, max_deviation_degrees=5.0
-    )
-
-    for expected_count, angle in enumerate((0.0, 4.0, 6.0, 8.0), 1):
-        frame = identity_body()
-        frame[4] = Rotation.from_euler(
-            "x", angle, degrees=True
-        ).as_quat()
-        assert calibrator.observe(frame) is False
-        assert calibrator.frames_collected == expected_count
-
-    moved = identity_body()
-    moved[4] = Rotation.from_euler("x", 9.0, degrees=True).as_quat()
-
-    assert calibrator.observe(moved) is False
-    assert calibrator.frames_collected == 1
-    assert calibrator.is_calibrated is False
-
-
-def test_rest_alignment_uses_raw_times_inverse_rest():
-    rest = np.repeat(
-        Rotation.from_euler("x", 25.0, degrees=True).as_quat()[None, :],
-        BODY_JOINT_COUNT,
-        axis=0,
-    )
-    yaw = Rotation.from_euler("y", 30.0, degrees=True)
-    raw = (yaw * Rotation.from_quat(rest)).as_quat()
-
-    aligned = apply_rest_alignment(raw, rest)
-    expected = np.repeat(yaw.as_quat()[None, :], BODY_JOINT_COUNT, axis=0)
-
-    np.testing.assert_allclose(
-        Rotation.from_quat(aligned).as_matrix(),
-        Rotation.from_quat(expected).as_matrix(),
-        atol=1e-6,
-    )
     assert aligned.dtype == np.float32
 
 
@@ -274,10 +160,6 @@ def test_all_converter_entry_points_reject_non_real_numeric_dtypes(
     with pytest.raises(ValueError):
         align_quaternion_signs(bad_quaternions)
     with pytest.raises(ValueError):
-        apply_rest_alignment(bad_quaternions, identity_body())
-    with pytest.raises(ValueError):
-        TPoseCalibrator().observe(bad_quaternions)
-    with pytest.raises(ValueError):
         synthesize_smpl_world_quats(bad_quaternions)
 
 
@@ -356,15 +238,12 @@ def test_wrist_helper_restricts_output_dtype(bad_dtype):
         build_elf3_joint_pos(pose, dtype=bad_dtype)
 
 
-def test_converter_uses_100_frames_only_for_rest_then_emits_frame_101():
+def test_converter_emits_first_vendor_calibrated_packet():
     converter = ZeroLabMotionConverter()
-    for index in range(100):
-        assert converter.observe(make_packet(index, identity47())) is None
+    output = converter.observe(make_packet(0, identity47()))
 
-    output = converter.observe(make_packet(100, identity47()))
-
-    assert output.frame_index == 100
-    assert output.receive_timestamp_ns == 2_000_000_000
+    assert output.frame_index == 0
+    assert output.receive_timestamp_ns == 0
     assert output.smpl_body_pose.shape == (21, 3)
     assert output.smpl_joints.shape == (24, 3)
     assert output.body_quat_w.shape == (4,)
@@ -377,20 +256,36 @@ def test_converter_uses_100_frames_only_for_rest_then_emits_frame_101():
     np.testing.assert_allclose(output.smpl_body_pose, 0.0, atol=1e-6)
 
 
+def test_converter_maps_vendor_world_pose_without_sampled_rest_inverse():
+    vendor = identity47()
+    vendor[3] = Rotation.from_euler("z", 30.0, degrees=True).as_quat()
+    converter = ZeroLabMotionConverter()
+
+    output = converter.observe(make_packet(0, vendor))
+
+    xrt = unity_world_quaternions_to_xrt(vendor, (47, 4))
+    expected_world = synthesize_smpl_world_quats(xrt[:BODY_JOINT_COUNT])
+    body_poses = np.zeros((24, 7), dtype=np.float32)
+    body_poses[:, 3:] = expected_world
+    expected = compute_from_body_poses(SMPL24_PARENTS, body_poses)
+    np.testing.assert_allclose(
+        output.smpl_body_pose,
+        expected["smpl_pose"][0, :63].reshape(21, 3),
+        atol=1e-6,
+    )
+
+
 def test_unity_yaw_direction_maps_physical_left_to_positive_sonic_yaw():
     converter = ZeroLabMotionConverter()
-    rest = identity47()
-    for index in range(100):
-        assert converter.observe(make_packet(index, rest)) is None
-    baseline = converter.observe(make_packet(100, rest))
+    baseline = converter.observe(make_packet(0, identity47()))
 
     unity_left = identity47()
     unity_left[:17] = [0.0, -0.25881904, 0.0, 0.9659258]
-    left = converter.observe(make_packet(101, unity_left))
+    left = converter.observe(make_packet(1, unity_left))
 
     unity_right = identity47()
     unity_right[:17] = [0.0, 0.25881904, 0.0, 0.9659258]
-    right = converter.observe(make_packet(102, unity_right))
+    right = converter.observe(make_packet(2, unity_right))
 
     baseline_yaw = Rotation.from_quat(
         baseline.body_quat_w[[1, 2, 3, 0]]
@@ -409,24 +304,20 @@ def test_unity_yaw_direction_maps_physical_left_to_positive_sonic_yaw():
 def test_rigid_yaw_matches_existing_fk_and_preserves_pelvis_relative_shape():
     converter = ZeroLabMotionConverter()
     rest = identity47()
-    for index in range(100):
-        converter.observe(make_packet(index, rest))
-    t_pose = converter.observe(make_packet(100, rest))
+    t_pose = converter.observe(make_packet(0, rest))
 
     unity_yaw = Rotation.from_euler("y", 30.0, degrees=True)
     unity_yawed = identity47()
     unity_yawed[:17] = (
         unity_yaw * Rotation.from_quat(rest[:17])
     ).as_quat()
-    output = converter.observe(make_packet(101, unity_yawed))
+    output = converter.observe(make_packet(1, unity_yawed))
 
     xrt_yawed = unity_yawed.astype(np.float64, copy=True)
     xrt_yawed /= np.linalg.norm(xrt_yawed, axis=1, keepdims=True)
     xrt_yawed[:, :2] *= -1.0
     xrt_yawed = np.ascontiguousarray(xrt_yawed, dtype=np.float32)
-    virtual = synthesize_smpl_world_quats(
-        apply_rest_alignment(xrt_yawed[:17], rest[:17])
-    )
+    virtual = synthesize_smpl_world_quats(xrt_yawed[:17])
     body_poses = np.zeros((24, 7), dtype=np.float32)
     body_poses[:, 3:] = virtual
     expected = compute_from_body_poses(SMPL24_PARENTS, body_poses)
@@ -444,11 +335,9 @@ def test_rigid_yaw_matches_existing_fk_and_preserves_pelvis_relative_shape():
 def test_converter_reflects_only_local_root_translation_for_fk(monkeypatch):
     converter = ZeroLabMotionConverter()
     rest = identity47()
-    for index in range(100):
-        assert converter.observe(make_packet(index, rest)) is None
 
     root = np.array([1.25, -2.5, 3.75], dtype=np.float32)
-    packet = make_packet(100, rest, root=root)
+    packet = make_packet(0, rest, root=root)
     original_root = packet.root_translation.copy()
     original_payload = packet.raw_payload
     captured = {}
@@ -470,14 +359,12 @@ def test_converter_reflects_only_local_root_translation_for_fk(monkeypatch):
 def test_left_elbow_motion_changes_only_left_wrist_chain():
     converter = ZeroLabMotionConverter()
     rest = identity47()
-    for index in range(100):
-        converter.observe(make_packet(index, rest))
-    t_pose = converter.observe(make_packet(100, rest))
+    t_pose = converter.observe(make_packet(0, rest))
 
     moved = identity47()
     left_rotation = Rotation.from_euler("z", 30.0, degrees=True).as_quat()
     moved[[4, 5]] = left_rotation
-    output = converter.observe(make_packet(101, moved))
+    output = converter.observe(make_packet(1, moved))
 
     assert not np.allclose(output.smpl_joints[20], t_pose.smpl_joints[20])
     assert not np.allclose(output.smpl_joints[22], t_pose.smpl_joints[22])
@@ -494,13 +381,11 @@ def test_left_elbow_motion_changes_only_left_wrist_chain():
 def test_converter_checks_47_quaternions_but_ignores_last_30():
     converter = ZeroLabMotionConverter()
     rest = identity47()
-    for index in range(100):
-        converter.observe(make_packet(index, rest))
-    baseline = converter.observe(make_packet(100, rest))
+    baseline = converter.observe(make_packet(0, rest))
 
     unused_changed = identity47()
     unused_changed[17:] = Rotation.random(30, random_state=123).as_quat()
-    output = converter.observe(make_packet(101, unused_changed))
+    output = converter.observe(make_packet(1, unused_changed))
     np.testing.assert_array_equal(
         output.smpl_body_pose, baseline.smpl_body_pose
     )
@@ -511,23 +396,18 @@ def test_converter_checks_47_quaternions_but_ignores_last_30():
     invalid_unused = identity47()
     invalid_unused[-1] = 0.0
     with pytest.raises(ValueError):
-        converter.observe(make_packet(102, invalid_unused))
+        converter.observe(make_packet(2, invalid_unused))
 
 
-def test_stale_and_reset_session_have_distinct_calibration_semantics():
+def test_stale_and_reset_session_clear_only_sign_continuity():
     converter = ZeroLabMotionConverter()
-    rest = identity47()
-    for index in range(99):
-        assert converter.observe(make_packet(index, rest)) is None
-    converter.mark_stale()
-    for index in range(99, 199):
-        assert converter.observe(make_packet(index, rest)) is None
-    assert converter.observe(make_packet(199, rest)) is not None
+    first = converter.observe(make_packet(0, identity47()))
+    assert first is not None
 
     converter.mark_stale()
-    assert converter.observe(make_packet(200, rest)) is not None
+    after_stale = converter.observe(make_packet(1, -identity47()))
+    assert after_stale is not None
 
     converter.reset_session()
-    for index in range(201, 301):
-        assert converter.observe(make_packet(index, rest)) is None
-    assert converter.observe(make_packet(301, rest)) is not None
+    after_reset = converter.observe(make_packet(2, identity47()))
+    assert after_reset is not None

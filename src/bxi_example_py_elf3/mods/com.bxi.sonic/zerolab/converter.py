@@ -1,4 +1,4 @@
-"""Quaternion calibration and ZeroLab-to-SONIC pose conversion."""
+"""Vendor-calibrated ZeroLab-to-SONIC pose conversion."""
 
 from dataclasses import dataclass
 
@@ -77,83 +77,6 @@ def align_quaternion_signs(current_xyzw, previous_xyzw=None):
     return current
 
 
-def apply_rest_alignment(raw_xyzw, rest_xyzw):
-    """Express raw world rotations relative to calibrated rest rotations."""
-    raw = _normalize_quaternions(raw_xyzw, _BODY_QUATERNION_SHAPE)
-    rest = _normalize_quaternions(rest_xyzw, _BODY_QUATERNION_SHAPE)
-    aligned = (
-        Rotation.from_quat(raw) * Rotation.from_quat(rest).inv()
-    ).as_quat()
-    return np.ascontiguousarray(aligned, dtype=np.float32)
-
-
-class TPoseCalibrator:
-    """Collect a stable quaternion window and derive its T-pose rest frame."""
-
-    def __init__(
-        self,
-        required_frames: int = 100,
-        max_deviation_degrees: float = 5.0,
-    ) -> None:
-        if isinstance(required_frames, bool) or required_frames < 1:
-            raise ValueError("required_frames must be at least 1")
-        if (
-            not np.isfinite(max_deviation_degrees)
-            or max_deviation_degrees < 0.0
-        ):
-            raise ValueError(
-                "max_deviation_degrees must be finite and non-negative"
-            )
-        self._required_frames = int(required_frames)
-        self._max_deviation_degrees = float(max_deviation_degrees)
-        self._window = []
-        self._rest_quats_xyzw = None
-
-    @property
-    def frames_collected(self) -> int:
-        return len(self._window)
-
-    @property
-    def is_calibrated(self) -> bool:
-        return self._rest_quats_xyzw is not None
-
-    @property
-    def rest_quats_xyzw(self):
-        if self._rest_quats_xyzw is None:
-            return None
-        return self._rest_quats_xyzw.copy()
-
-    def reset(self) -> None:
-        self._window = []
-        self._rest_quats_xyzw = None
-
-    def observe(self, frame_xyzw) -> bool:
-        frame = _normalize_quaternions(frame_xyzw, _BODY_QUATERNION_SHAPE)
-        if self.is_calibrated:
-            return True
-
-        previous = self._window[-1] if self._window else None
-        frame = align_quaternion_signs(frame, previous)
-        candidate = self._window + [frame]
-        mean = _normalize_quaternions(
-            np.mean(candidate, axis=0, dtype=np.float64),
-            _BODY_QUATERNION_SHAPE,
-        )
-        dots = np.sum(np.asarray(candidate) * mean, axis=2)
-        angular_distances = np.degrees(
-            2.0 * np.arccos(np.clip(np.abs(dots), 0.0, 1.0))
-        )
-        if np.any(angular_distances > self._max_deviation_degrees):
-            self._window = [frame]
-        else:
-            self._window = candidate
-
-        if len(self._window) == self._required_frames:
-            self._rest_quats_xyzw = mean
-            return True
-        return False
-
-
 def _shortest_path_slerp(start_xyzw, end_xyzw, fraction):
     start = _normalize_quaternions(
         np.asarray(start_xyzw)[None, :], (1, 4)
@@ -227,42 +150,28 @@ def _validated_converted_array(
 
 
 class ZeroLabMotionConverter:
-    """Calibrate ZeroLab rest quaternions and emit SONIC pose frames."""
+    """Convert vendor-calibrated ZeroLab world poses to SONIC frames."""
 
     def __init__(self) -> None:
-        self._calibrator = TPoseCalibrator()
         self._previous_raw_quats_xyzw = None
 
     def mark_stale(self) -> None:
-        """Clear continuity and any incomplete rest-calibration window."""
         self._previous_raw_quats_xyzw = None
-        if not self._calibrator.is_calibrated:
-            self._calibrator.reset()
 
     def reset_session(self) -> None:
-        """Clear quaternion continuity and all session calibration."""
         self._previous_raw_quats_xyzw = None
-        self._calibrator.reset()
 
-    def observe(self, packet: ZeroLabPacket) -> ConvertedPoseFrame | None:
-        """Observe a packet and return a frame after rest calibration."""
+    def observe(self, packet: ZeroLabPacket) -> ConvertedPoseFrame:
+        """Observe a vendor-calibrated packet and return its SONIC frame."""
         raw_quats = unity_world_quaternions_to_xrt(
             packet.joint_quat_world_xyzw, _PACKET_QUATERNION_SHAPE
         )
         raw_quats = align_quaternion_signs(
             raw_quats, self._previous_raw_quats_xyzw
         )
-
-        if not self._calibrator.is_calibrated:
-            self._calibrator.observe(raw_quats[:BODY_JOINT_COUNT])
-            self._previous_raw_quats_xyzw = raw_quats
-            return None
-
-        aligned_body = apply_rest_alignment(
-            raw_quats[:BODY_JOINT_COUNT],
-            self._calibrator.rest_quats_xyzw,
+        smpl_world_quats = synthesize_smpl_world_quats(
+            raw_quats[:BODY_JOINT_COUNT]
         )
-        smpl_world_quats = synthesize_smpl_world_quats(aligned_body)
         body_poses = np.zeros((24, 7), dtype=np.float32)
         body_poses[:, 3:] = smpl_world_quats
         root_translation = _validated_root_translation(packet.root_translation)
