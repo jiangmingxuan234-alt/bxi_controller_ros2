@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 import sys
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 
 import numpy as np
 import pytest
@@ -53,6 +53,10 @@ class FakePolicy:
         self.target = target
         self.fresh = False
         self.step_calls = 0
+        self.held = False
+        self.rearming = False
+        self.rearm_progress = 0.0
+        self.rearm_progress_at_step = []
         self.head_joint_target = np.zeros(2, dtype=np.float32)
         self.last_status = "idle_reference"
 
@@ -64,14 +68,34 @@ class FakePolicy:
 
     def reset(self, _frame=None):
         self.step_calls = 0
+        self.rearm_progress_at_step.clear()
 
     def step(self, _frame, _dt, *, advance=True):
         if advance:
             self.step_calls += 1
+            self.rearm_progress_at_step.append(self.rearm_progress)
         return self.output
 
     def has_fresh_live_reference(self, _timeout_s=None):
         return self.fresh
+
+    def hold_live_reference(self):
+        self.held = True
+        self.rearming = False
+        return True
+
+    def begin_live_reference_rearm(self):
+        if not self.fresh or not self.held:
+            return False
+        self.rearming = True
+        return True
+
+    def set_live_reference_rearm_progress(self, alpha):
+        self.rearm_progress = float(alpha)
+
+    def complete_live_reference_rearm(self):
+        self.rearming = False
+        self.held = False
 
     def reset_yaw_alignment(self):
         pass
@@ -213,18 +237,11 @@ def fully_armed_state():
     return state, sonic, normal, ctx
 
 
-def state_in_active_phase(phase):
-    state, sonic, normal, ctx = fully_armed_state()
-    if phase is ZeroLabArmPhase.BLENDING:
-        state, sonic, normal, ctx = armed_state_at_half_blend()
-    return state, sonic, normal, ctx
-
-
-def stale_hold_state():
+def reference_hold_state():
     state, sonic, normal, ctx = fully_armed_state()
     sonic.fresh = False
     state.sample_running_frame(ctx, 0.02, advance=True)
-    assert state.arm_phase is ZeroLabArmPhase.HOLD_STALE
+    assert state.arm_phase is ZeroLabArmPhase.HOLD_REFERENCE
     return state, sonic, normal, ctx
 
 
@@ -234,6 +251,30 @@ def waiting_arm_state():
     state.sample_running_frame(ctx, 0.02, advance=True)
     assert state.arm_phase is ZeroLabArmPhase.WAIT_ARM
     return state, sonic, normal, ctx
+
+
+def rearming_state():
+    state, sonic, normal, ctx = reference_hold_state()
+    sonic.fresh = True
+    assert state.on_action(ctx, "arm_zerolab") is True
+    assert state.arm_phase is ZeroLabArmPhase.REARMING
+    return state, sonic, normal, ctx
+
+
+def state_in_phase(phase_name):
+    if phase_name == "wait_stream":
+        return prepared_state()
+    if phase_name == "wait_arm":
+        return waiting_arm_state()
+    if phase_name == "blending":
+        return armed_state_at_half_blend()
+    if phase_name == "armed":
+        return fully_armed_state()
+    if phase_name == "hold_reference":
+        return reference_hold_state()
+    if phase_name == "rearming":
+        return rearming_state()
+    raise AssertionError(f"unexpected phase {phase_name}")
 
 
 def copy_motor_frame(frame):
@@ -260,14 +301,6 @@ def full_motor_frame(*, qpos, kp, kd, vel, torque):
     )
 
 
-def assert_motor_frames_equal(actual, expected):
-    np.testing.assert_allclose(actual.qpos, expected.qpos)
-    np.testing.assert_allclose(actual.kp, expected.kp)
-    np.testing.assert_allclose(actual.kd, expected.kd)
-    np.testing.assert_allclose(actual.vel, expected.vel)
-    np.testing.assert_allclose(actual.torque, expected.torque)
-
-
 def test_arm_blend_seconds_must_be_finite_and_positive():
     for value in (0.0, -1.0, float("inf"), float("nan")):
         with pytest.raises(ValueError, match="arm_blend_seconds"):
@@ -282,7 +315,7 @@ def test_waiting_applies_changing_live_normal_with_zero_command():
     normal.target.position.fill(0.7)
     second = copy_motor_frame(state.sample_running_frame(ctx, 0.02, advance=True))
 
-    assert state.arm_phase is ZeroLabArmPhase.WAIT_CALIBRATION
+    assert state.arm_phase is ZeroLabArmPhase.WAIT_STREAM
     np.testing.assert_allclose(first.qpos, 0.4)
     np.testing.assert_allclose(second.qpos, 0.7)
     np.testing.assert_allclose(ctx.inference_frame.command, 0.0)
@@ -291,15 +324,15 @@ def test_waiting_applies_changing_live_normal_with_zero_command():
     np.testing.assert_allclose(state.get_entry_frame(ctx).qpos, 0.25)
 
 
-def test_prepare_logs_initial_wait_calibration_phase_once():
+def test_prepare_logs_initial_wait_stream_phase_once():
     state, _sonic, _normal, ctx = prepared_state(entry_value=0.0)
     state.on_prepare(ctx, object())
 
     messages = [
         message for _level, message in state.logger.messages
-        if "ZeroLab ARM phase: WAIT_CALIBRATION" in message
+        if "ZeroLab ARM phase: WAIT_STREAM" in message
     ]
-    assert messages == ["ZeroLab ARM phase: WAIT_CALIBRATION"]
+    assert messages == ["ZeroLab ARM phase: WAIT_STREAM"]
 
 
 def test_fresh_reference_waits_for_explicit_arm():
@@ -316,7 +349,7 @@ def test_fresh_reference_waits_for_explicit_arm():
 def test_arm_is_rejected_until_fresh_reference_exists():
     state, sonic, normal, ctx = prepared_state(entry_value=0.0)
     assert state.on_action(ctx, "arm_zerolab") is True
-    assert state.arm_phase is ZeroLabArmPhase.WAIT_CALIBRATION
+    assert state.arm_phase is ZeroLabArmPhase.WAIT_STREAM
 
 
 def test_first_arm_blends_current_normal_and_current_sonic():
@@ -355,69 +388,115 @@ def test_blend_frames_interpolates_all_complete_motor_fields():
     np.testing.assert_allclose(output.torque, 5.0)
 
 
-def test_duplicate_arm_does_not_restart_blend():
-    state, sonic, normal, ctx = armed_state_at_half_blend()
-    before = state._blend_elapsed_s
+@pytest.mark.parametrize("phase_name", ["blending", "armed", "rearming"])
+def test_duplicate_arm_does_not_restart_active_phase(phase_name):
+    state, sonic, normal, ctx = state_in_phase(phase_name)
+    elapsed_before = state._blend_elapsed_s
+    progress_before = sonic.rearm_progress
+
     assert state.on_action(ctx, "arm_zerolab") is True
-    assert state._blend_elapsed_s == before
-    assert state.arm_phase is ZeroLabArmPhase.BLENDING
+
+    assert state.arm_phase.value == phase_name
+    assert state._blend_elapsed_s == elapsed_before
+    assert sonic.rearm_progress == progress_before
 
 
-@pytest.mark.parametrize("starting_phase", [
-    ZeroLabArmPhase.BLENDING,
-    ZeroLabArmPhase.ARMED,
-])
-def test_stale_reference_freezes_last_applied_frame_and_cancels_arm(starting_phase):
-    state, sonic, normal, ctx = state_in_active_phase(starting_phase)
-    before = copy_motor_frame(state.sample_running_frame(ctx, 0.02, advance=True))
+def test_initial_blend_stale_cancels_to_live_normal():
+    state, sonic, normal, ctx = armed_state_at_half_blend()
     sonic.fresh = False
-    sonic.target.position.fill(9.0)
+    normal.target.position.fill(0.75)
 
-    after = state.sample_running_frame(ctx, 0.02, advance=True)
+    frame = state.sample_running_frame(ctx, 0.02, advance=True)
 
-    assert state.arm_phase is ZeroLabArmPhase.HOLD_STALE
-    assert_motor_frames_equal(after, before)
+    assert state.arm_phase is ZeroLabArmPhase.WAIT_STREAM
+    np.testing.assert_allclose(frame.qpos, 0.75)
+    assert normal.step_calls >= 1
 
 
-def test_recovery_does_not_resume_until_rearmed():
-    state, sonic, normal, ctx = stale_hold_state()
-    frozen = copy_motor_frame(state.sample_running_frame(ctx, 0.02, advance=True))
+def test_armed_stale_holds_reference_but_keeps_sonic_closed_loop():
+    state, sonic, normal, ctx = fully_armed_state()
+    sonic.fresh = False
+    sonic.target.position.fill(3.0)
+    calls = sonic.step_calls
+
+    first = copy_motor_frame(state.sample_running_frame(ctx, 0.02, advance=True))
+    sonic.target.position.fill(4.0)
+    second = copy_motor_frame(state.sample_running_frame(ctx, 0.02, advance=True))
+
+    assert sonic.step_calls == calls + 2
+    np.testing.assert_allclose(first.qpos, 3.0)
+    np.testing.assert_allclose(second.qpos, 4.0)
+    assert state.arm_phase is ZeroLabArmPhase.HOLD_REFERENCE
+    assert sonic.held is True
+
+
+def test_recovered_reference_stays_gated_until_explicit_rearm():
+    state, sonic, normal, ctx = reference_hold_state()
     sonic.fresh = True
-    sonic.target.position.fill(2.0)
-
-    waiting = state.sample_running_frame(ctx, 0.02, advance=True)
-    assert state.arm_phase is ZeroLabArmPhase.HOLD_STALE
-    assert_motor_frames_equal(waiting, frozen)
+    state.sample_running_frame(ctx, 0.02, advance=True)
+    assert state.arm_phase is ZeroLabArmPhase.HOLD_REFERENCE
+    assert sonic.rearming is False
 
     state.on_action(ctx, "arm_zerolab")
-    resumed = state.sample_running_frame(ctx, 0.0, advance=True)
-    assert state.arm_phase is ZeroLabArmPhase.BLENDING
-    assert_motor_frames_equal(resumed, frozen)
+    state.sample_running_frame(ctx, 1.0, advance=True)
+    assert state.arm_phase is ZeroLabArmPhase.REARMING
+    assert sonic.rearm_progress == pytest.approx(0.5)
 
 
-def test_wait_arm_stale_gap_continues_live_normal():
+def test_wait_arm_stale_returns_to_wait_stream_with_live_normal():
     state, sonic, normal, ctx = waiting_arm_state()
     sonic.fresh = False
     normal.target.position.fill(0.6)
 
     frame = state.sample_running_frame(ctx, 1.0, advance=True)
 
-    assert state.arm_phase is ZeroLabArmPhase.WAIT_ARM
+    assert state.arm_phase is ZeroLabArmPhase.WAIT_STREAM
     np.testing.assert_allclose(frame.qpos, 0.6)
     assert normal.step_calls >= 2
 
 
+def test_rearm_completes_after_two_seconds_with_live_sonic_output():
+    state, sonic, normal, ctx = rearming_state()
+    sonic.target.position.fill(3.0)
+    calls = sonic.step_calls
+    progress_samples = len(sonic.rearm_progress_at_step)
+
+    first = copy_motor_frame(state.sample_running_frame(ctx, 1.0, advance=True))
+    sonic.target.position.fill(4.0)
+    second = copy_motor_frame(state.sample_running_frame(ctx, 1.0, advance=True))
+
+    np.testing.assert_allclose(first.qpos, 3.0)
+    np.testing.assert_allclose(second.qpos, 4.0)
+    assert sonic.step_calls == calls + 2
+    assert sonic.rearm_progress_at_step[progress_samples:] == [0.5, 1.0]
+    assert sonic.rearm_progress == pytest.approx(1.0)
+    assert sonic.rearming is False
+    assert sonic.held is False
+    assert state.arm_phase is ZeroLabArmPhase.ARMED
+
+
+def test_stale_during_rearm_returns_to_reference_hold():
+    state, sonic, normal, ctx = rearming_state()
+    state.sample_running_frame(ctx, 0.5, advance=True)
+    sonic.fresh = False
+    sonic.target.position.fill(5.0)
+    calls = sonic.step_calls
+
+    frame = state.sample_running_frame(ctx, 0.1, advance=True)
+
+    np.testing.assert_allclose(frame.qpos, 5.0)
+    assert sonic.step_calls == calls + 1
+    assert sonic.held is True
+    assert sonic.rearming is False
+    assert state.arm_phase is ZeroLabArmPhase.HOLD_REFERENCE
+
+
 @pytest.mark.parametrize(
     "phase_name",
-    ["wait_calibration", "wait_arm", "initial_blend"],
+    ["wait_stream", "wait_arm", "blending"],
 )
 def test_live_normal_phases_keep_normal_orientation_safety(phase_name):
-    if phase_name == "wait_calibration":
-        state, sonic, normal, ctx = prepared_state()
-    else:
-        state, sonic, normal, ctx = waiting_arm_state()
-    if phase_name == "initial_blend":
-        state.on_action(ctx, "arm_zerolab")
+    state, sonic, normal, ctx = state_in_phase(phase_name)
     ctx.orientation_unsafe = True
 
     state.on_update(ctx, 0.02)
@@ -428,8 +507,12 @@ def test_live_normal_phases_keep_normal_orientation_safety(phase_name):
     assert ctx.applied is None
 
 
-def test_fully_armed_keeps_existing_sonic_orientation_behavior():
-    state, sonic, normal, ctx = fully_armed_state()
+@pytest.mark.parametrize(
+    "phase_name",
+    ["armed", "hold_reference", "rearming"],
+)
+def test_live_sonic_phases_keep_existing_sonic_orientation_behavior(phase_name):
+    state, sonic, normal, ctx = state_in_phase(phase_name)
     ctx.orientation_unsafe = True
 
     state.on_update(ctx, 0.02)
@@ -438,25 +521,33 @@ def test_fully_armed_keeps_existing_sonic_orientation_behavior():
     assert ctx.applied is not None
 
 
-def test_frozen_recovery_blend_keeps_existing_sonic_orientation_behavior():
-    state, sonic, normal, ctx = stale_hold_state()
-    sonic.fresh = True
-    state.on_action(ctx, "arm_zerolab")
-    ctx.orientation_unsafe = True
+@pytest.mark.parametrize(
+    "phase_name",
+    [
+        "wait_stream",
+        "wait_arm",
+        "blending",
+        "armed",
+        "hold_reference",
+        "rearming",
+    ],
+)
+def test_emergency_routes_remain_unconsumed_in_every_phase(phase_name):
+    state, sonic, normal, ctx = state_in_phase(phase_name)
+    phase_before = state.arm_phase
 
-    state.on_update(ctx, 0.02)
-
-    assert state._blend_source is arming_module.ZeroLabBlendSource.FROZEN
-    assert ctx.requested_states == []
-    assert ctx.applied is not None
+    assert state.on_action(ctx, "com.bxi.basic_actions/zero_torque") is False
+    assert state.arm_phase is phase_before
 
 
-def test_exit_clears_arm_session_and_next_prepare_requires_calibration():
+def test_exit_clears_arm_session_and_next_prepare_waits_for_stream():
     state, sonic, normal, ctx = fully_armed_state()
     state.on_exit(ctx)
+    assert state.arm_phase is ZeroLabArmPhase.WAIT_STREAM
+
     sonic.fresh = False
-    state.on_prepare(ctx, SimpleNamespace())
-    assert state.arm_phase is ZeroLabArmPhase.WAIT_CALIBRATION
+    state.on_prepare(ctx, object())
+    assert state.arm_phase is ZeroLabArmPhase.WAIT_STREAM
 
 
 def test_stale_and_recovery_logs_are_emitted_once_per_stale_session():
@@ -471,11 +562,13 @@ def test_stale_and_recovery_logs_are_emitted_once_per_stale_session():
 
     stale_messages = [
         message for _, message in logger.messages
-        if "ZeroLab reference stale; holding last motor frame and ARM cancelled" in message
+        if "ZeroLab reference stale; holding human reference while SONIC balance continues"
+        in message
     ]
     recovery_messages = [
         message for _, message in logger.messages
-        if "ZeroLab reference recovered; send btn_10=12 to resume" in message
+        if "ZeroLab reference recovered; fresh input pending; send btn_10=12 to rearm"
+        in message
     ]
     assert len(stale_messages) == 1
     assert len(recovery_messages) == 1
