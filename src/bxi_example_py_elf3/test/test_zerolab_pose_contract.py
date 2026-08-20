@@ -115,76 +115,79 @@ def test_window_rejects_malformed_or_nonfinite_converted_frames(replacement):
         PoseChunkWindow(10).append(replacement(converted(0)))
 
 
-def test_non_increasing_frame_index_is_rejected_and_clears_window():
+def test_duplicate_is_ignored_without_revoking_partial_window():
+    window = PoseChunkWindow(10)
+    for index in range(5):
+        assert window.append(converted(index)) is None
+    assert window.append(converted(4)) is None
+    for index in range(5, 10):
+        fields = window.append(converted(index))
+    np.testing.assert_array_equal(fields["frame_index"], np.arange(10))
+
+
+def test_forward_gap_starts_a_new_consecutive_window():
+    window = PoseChunkWindow(10)
+    for index in range(5):
+        window.append(converted(index))
+    assert window.append(converted(8)) is None
+    for index in range(9, 18):
+        fields = window.append(converted(index))
+    np.testing.assert_array_equal(fields["frame_index"], np.arange(8, 18))
+
+
+def test_forward_gap_discards_a_nearly_ready_window():
+    window = PoseChunkWindow(10)
+    for index in range(9):
+        assert window.append(converted(index)) is None
+
+    assert window.append(converted(10)) is None
+    assert window.ready is False
+
+
+def test_backward_index_clears_and_is_rejected():
     window = PoseChunkWindow(10)
     window.append(converted(5))
-
-    with pytest.raises(ValueError, match="strictly increasing"):
-        window.append(converted(5))
+    with pytest.raises(ValueError, match="backward"):
+        window.append(converted(4))
 
     assert window.ready is False
 
 
-def test_core_first_ready_chunk_is_source_frames_100_through_109():
+def test_core_first_ready_chunk_is_source_frames_zero_through_nine():
     core = ZeroLabSourceCore(ZeroLabMotionConverter())
-    for index in range(109):
+    for index in range(9):
         assert core.accept(identity_packet(index)) is None
 
-    fields = core.accept(identity_packet(109))
+    fields = core.accept(identity_packet(9))
 
-    assert fields is not None
-    np.testing.assert_array_equal(
-        fields["frame_index"], np.arange(100, 110, dtype=np.int64)
-    )
+    np.testing.assert_array_equal(fields["frame_index"], np.arange(10))
 
 
-def test_completed_rest_keeps_calibration_but_refills_after_stale_gap():
+def test_completed_stream_refills_after_stale_gap():
     core = ZeroLabSourceCore(ZeroLabMotionConverter())
-    for index in range(110):
+    for index in range(10):
         fields = core.accept(identity_packet(index))
     assert fields is not None
 
-    last_timestamp_ns = 109 * 20_000_000
+    last_timestamp_ns = 9 * 20_000_000
     assert core.check_stale(last_timestamp_ns + 500_000_000) is False
     assert core.check_stale(last_timestamp_ns + 500_000_001) is True
     assert core.check_stale(last_timestamp_ns + 600_000_000) is False
 
     fresh_start_ns = last_timestamp_ns + 500_000_001
-    for index in range(110, 119):
+    for index in range(10, 19):
         assert core.accept(
             identity_packet(
                 index,
-                timestamp_ns=fresh_start_ns + (index - 110) * 20_000_000,
+                timestamp_ns=fresh_start_ns + (index - 10) * 20_000_000,
             )
         ) is None
     fields = core.accept(
-        identity_packet(119, timestamp_ns=fresh_start_ns + 180_000_000)
+        identity_packet(19, timestamp_ns=fresh_start_ns + 180_000_000)
     )
 
     np.testing.assert_array_equal(
-        fields["frame_index"], np.arange(110, 120, dtype=np.int64)
-    )
-
-
-def test_stale_gap_during_calibration_restarts_the_hundred_frame_rest_window():
-    core = ZeroLabSourceCore(ZeroLabMotionConverter())
-    for index in range(50):
-        assert core.accept(identity_packet(index)) is None
-
-    fresh_start_ns = 49 * 20_000_000 + 500_000_001
-    for index in range(50, 159):
-        assert core.accept(
-            identity_packet(
-                index,
-                timestamp_ns=fresh_start_ns + (index - 50) * 20_000_000,
-            )
-        ) is None
-    fields = core.accept(
-        identity_packet(159, timestamp_ns=fresh_start_ns + 2_180_000_000)
-    )
-
-    np.testing.assert_array_equal(
-        fields["frame_index"], np.arange(150, 160, dtype=np.int64)
+        fields["frame_index"], np.arange(10, 20, dtype=np.int64)
     )
 
 

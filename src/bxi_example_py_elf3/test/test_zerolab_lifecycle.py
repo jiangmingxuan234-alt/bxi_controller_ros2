@@ -246,16 +246,16 @@ def test_executor_gap_logs_stale_once_then_ready_once_after_refill(
     node._stream_state = None
     node.get_logger = lambda: logger
 
-    for frame_index in range(110):
+    for frame_index in range(10):
         clock_ns[0] = frame_index * 20_000_000
         receiver.queue(frame_index, clock_ns[0])
         node._tick()
 
-    assert publisher.frame_indices == [109]
-    assert logger.infos.count("ZeroLab stream ready; frame=109") == 1
+    assert publisher.frame_indices == [9]
+    assert logger.infos.count("ZeroLab stream ready; frame=9") == 1
 
     clock_ns[0] += 500_000_001
-    receiver.queue(110, clock_ns[0])
+    receiver.queue(10, clock_ns[0])
     node._tick()
     node._tick()
 
@@ -263,16 +263,16 @@ def test_executor_gap_logs_stale_once_then_ready_once_after_refill(
     assert logger.warnings.count(stale_message) == 1
 
     gap_timestamp_ns = clock_ns[0]
-    for frame_index in range(111, 120):
-        clock_ns[0] = gap_timestamp_ns + (frame_index - 110) * 20_000_000
+    for frame_index in range(11, 20):
+        clock_ns[0] = gap_timestamp_ns + (frame_index - 10) * 20_000_000
         receiver.queue(frame_index, clock_ns[0])
         node._tick()
     node._tick()
 
-    assert publisher.frame_indices == [109, 119]
+    assert publisher.frame_indices == [9, 19]
     assert logger.warnings.count(stale_message) == 1
-    assert logger.infos.count("ZeroLab stream ready; frame=119") == 1
-    assert logger.infos.count("ZeroLab collecting T-pose calibration") == 2
+    assert logger.infos.count("ZeroLab stream ready; frame=19") == 1
+    assert logger.infos.count("ZeroLab waiting for 10-frame stream window") == 2
 
 
 def test_executor_gap_backlog_logs_stale_before_same_tick_ready(monkeypatch):
@@ -296,28 +296,28 @@ def test_executor_gap_backlog_logs_stale_before_same_tick_ready(monkeypatch):
     node._stream_state = None
     node.get_logger = lambda: logger
 
-    for frame_index in range(110):
+    for frame_index in range(10):
         clock_ns[0] = frame_index * 20_000_000
         receiver.queue(frame_index, clock_ns[0])
         node._tick()
 
     pre_gap_timestamp_ns = clock_ns[0] + 20_000_000
-    receiver.queue(110, pre_gap_timestamp_ns)
+    receiver.queue(10, pre_gap_timestamp_ns)
     gap_timestamp_ns = pre_gap_timestamp_ns + 500_000_001
-    for frame_index in range(111, 121):
-        timestamp_ns = gap_timestamp_ns + (frame_index - 111) * 20_000_000
+    for frame_index in range(11, 21):
+        timestamp_ns = gap_timestamp_ns + (frame_index - 11) * 20_000_000
         receiver.queue(frame_index, timestamp_ns)
         clock_ns[0] = timestamp_ns
     node._tick()
     node._tick()
 
     stale_message = "ZeroLab input stale; live pose publication stopped"
-    assert publisher.frame_indices == [109, 120]
+    assert publisher.frame_indices == [9, 20]
     np.testing.assert_array_equal(
-        publisher.frame_windows[-1], np.arange(111, 121)
+        publisher.frame_windows[-1], np.arange(11, 21)
     )
     assert logger.warnings.count(stale_message) == 1
-    ready_message = "ZeroLab stream ready; frame=120"
+    ready_message = "ZeroLab stream ready; frame=20"
     assert logger.infos.count(ready_message) == 1
     stale_event = logger.events.index(("warning", stale_message))
     ready_event = logger.events.index(("info", ready_message))

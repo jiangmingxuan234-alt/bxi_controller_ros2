@@ -156,17 +156,20 @@ class PoseChunkWindow:
             raise ValueError("frame_index must be an integer") from error
         if isinstance(frame.frame_index, bool):
             raise ValueError("frame_index must be an integer")
-        if (
-            self._last_frame_index is not None
-            and frame_index <= self._last_frame_index
-        ):
-            self.clear()
-            raise ValueError("frame_index values must be strictly increasing")
 
         validated = {
             name: _as_finite_float32(name, getattr(frame, name), shape)
             for name, shape in _POSE_FIELDS.items()
         }
+        if self._last_frame_index is not None:
+            delta = frame_index - self._last_frame_index
+            if delta == 0:
+                return None
+            if delta < 0:
+                self.clear()
+                raise ValueError("frame_index moved backward")
+            if delta > 1:
+                self.clear()
         self._frames.append((frame_index, validated))
         self._last_frame_index = frame_index
         if not self.ready:
@@ -236,8 +239,6 @@ class ZeroLabSourceCore:
         frame = self._converter.observe(packet)
         self._last_timestamp_ns = timestamp_ns
         self._stale_handled = False
-        if frame is None:
-            return None
         return self._window.append(frame)
 
     def check_stale(self, now_ns: int) -> bool:
@@ -417,7 +418,7 @@ class ZeroLabSourceNode(Node):
             return
         self._stream_state = state
         if state == "collecting":
-            self.get_logger().info("ZeroLab collecting T-pose calibration")
+            self.get_logger().info("ZeroLab waiting for 10-frame stream window")
         elif state == "ready":
             self.get_logger().info(
                 f"ZeroLab stream ready; frame={frame_index}"
