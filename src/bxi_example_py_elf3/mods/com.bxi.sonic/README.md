@@ -603,7 +603,10 @@ HOLD_REFERENCE + btn_10=12 -> 2 s REARMING -> ARMED
 `btn_10=11` 后，ZeroLab source/bridge 与 SONIC policy 在后台运行。source 连续收到
 严格的 10 帧完整数据后才进入 `WAIT_ARM`；在 `WAIT_STREAM` 和 `WAIT_ARM` 中，电机输出
 由零速度 Normal policy 每周期实时更新，而不是重复一张 Normal 快照。初次 ARM 时，系统
-在 2.0 秒内将实时 Normal 与实时 SONIC 输出混合，之后才进入 `ARMED`。
+在 2.0 秒内将实时 Normal 与实时 SONIC 输出混合，之后才进入 `ARMED`。live reference/source
+连续 0.5 s 未更新即视为 stale；如果这发生在初次 `BLENDING`，系统取消初次 ARM、重置为
+`WAIT_STREAM`，并立即回到实时零速度 Normal 输出。重新满足严格连续 10 帧后才会再次进入
+`WAIT_ARM`，不能由旧数据直接接管。
 
 等待终端1显示 source、bridge 已就绪并进入 `WAIT_ARM`：
 
@@ -634,10 +637,11 @@ ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{}'
 ```
 
 ARM 后的 2.0 秒交接期间继续保持中立姿态。两秒 blend 可以减小指令跳变，但不能纠正错误的
-目标姿态。`ARMED` 输入过期时进入 `HOLD_REFERENCE`：系统保持已接受的人体 reference，
-继续使用 SONIC 与当前本体感知闭环平衡，并非冻结最后一张电机命令。新鲜输入恢复后仍处于
-待授权状态；安全员必须再次发送 `btn_10=12`，系统才在 reference space 内执行 2.0 秒
-`REARMING` 后回到 `ARMED`。系统不会自动进入 PD brake，也不会自动恢复人体控制。
+目标姿态。`ARMED` 中连续 0.5 s 未更新的 live reference/source 会进入 `HOLD_REFERENCE`：
+系统保持已接受的人体 reference，继续使用 SONIC 与当前本体感知闭环平衡，并非冻结最后一张
+电机命令。新鲜输入恢复后仍处于待授权状态；安全员必须再次发送 `btn_10=12`，系统才在
+reference space 内执行 2.0 秒 `REARMING` 后回到 `ARMED`。系统不会自动进入 PD brake，
+也不会自动恢复人体控制。
 
 MuJoCo acceptance 必须覆盖 0.6 s、2 s 和 30 s 的 dropout：确认 `WAIT_STREAM`/`WAIT_ARM`
 持续实时 Normal、初次 2.0 秒 blend，以及 `HOLD_REFERENCE` 后的显式 rearm。硬件仍然禁止，
