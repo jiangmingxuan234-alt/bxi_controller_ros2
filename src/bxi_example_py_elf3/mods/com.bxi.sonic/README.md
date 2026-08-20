@@ -536,8 +536,11 @@ reference 时进入。因为可用性检查发生在 state-scoped 节点 prepare
 ## ZeroLab 实时 MuJoCo 遥操
 
 固定条件：MotionCaptureMaster 关闭镜像；Windows 发送端为 `192.168.89.171`；以
-50 Hz、每包 992 字节向 Ubuntu `192.168.88.161:18000` 发送 UDP。ZeroLab 状态使用
-`btn_10=11`，不会启动 PICO manager、RoboticsService、RTSP 或夹爪/头部控制。
+50 Hz、每包 992 字节向 Ubuntu `192.168.88.161:18000` 发送 UDP。开始前必须在
+ZeroLab 厂家软件完成 N-pose 标定并回到中立姿势；UDP 的 world quaternion 已是厂家
+标定后的数据。应用不执行运行时 T-pose、静止姿势或其他人体重标定。ZeroLab 状态使用
+`btn_10=11`，不会启动 PICO manager、RoboticsService、RTSP 或夹爪/头部控制；PICO
+的独立提示和行为保持不变。
 
 不要同时运行 `zerolab.record_cli`、UDP 录制回放、独立 `zerolab_source` 或独立 bridge；
 它们会竞争 18000、5558 或 5557 端口。
@@ -589,14 +592,20 @@ sleep 1
 ```
 
 ```text
-btn_10=11 后，ZeroLab source/bridge 与 SONIC policy 在后台运行；电机输出由零速度 Normal policy 每周期更新，不是重复一张 Normal 快照。
-WAIT_CALIBRATION 和 WAIT_ARM 中的数据短停不会停止 Normal 平衡，也不会允许 SONIC 接管。
-首次 btn_10=12 在两秒内动态混合当前 Normal 与当前 SONIC 输出；ARMED 后停止 Normal inference。
-BLENDING/ARMED 断流仍冻结最后实际输出并取消 ARM；恢复后必须再次发送 btn_10=12，恢复 blend 从冻结帧开始。
+vendor N-pose -> operator neutral -> btn_10=11 -> WAIT_STREAM
+-> WAIT_ARM -> btn_10=12 -> 2 s BLENDING -> ARMED
+
+ARMED + stale -> HOLD_REFERENCE
+HOLD_REFERENCE + recovered stream -> still gated
+HOLD_REFERENCE + btn_10=12 -> 2 s REARMING -> ARMED
 ```
 
-操作者再持续保持标准 T-pose，直到终端1显示 source、bridge 已就绪并进入
-`WAIT_ARM`：
+`btn_10=11` 后，ZeroLab source/bridge 与 SONIC policy 在后台运行。source 连续收到
+严格的 10 帧完整数据后才进入 `WAIT_ARM`；在 `WAIT_STREAM` 和 `WAIT_ARM` 中，电机输出
+由零速度 Normal policy 每周期实时更新，而不是重复一张 Normal 快照。初次 ARM 时，系统
+在 2.0 秒内将实时 Normal 与实时 SONIC 输出混合，之后才进入 `ARMED`。
+
+等待终端1显示 source、bridge 已就绪并进入 `WAIT_ARM`：
 
 ```text
 ZeroLab stream ready; frame=...
@@ -604,9 +613,9 @@ PICO source chunks ready; sent=...
 ZeroLab ARM phase: WAIT_ARM
 ```
 
-100 帧标定期间 MuJoCo 使用 idle policy 姿态，窗口里没有显示人体 T-pose 属于正常现象；
-不能把 MuJoCo 是否摆出 T-pose 当作标定完成信号。以上日志全部出现后，操作者放下双臂，
-回到准备接管的中立姿态。系统没有自动的人体姿态安全门，安全员必须自行确认目标姿态正确。
+兼容旧 wire 协议的 `calibration_ready` 仅表示完整 source window 已到达；它不是新的操作者
+标定步骤。以上日志出现后，操作者保持准备接管的中立姿态。系统没有自动的人体姿态安全门，
+安全员必须自行确认目标姿态正确。
 
 安全员先准备好下面相邻的 PD brake 命令，确认操作者保持中立姿态后，再发送 ARM：
 
@@ -624,12 +633,16 @@ ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{btn_3:
 ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{}'
 ```
 
-ARM 后的两秒交接期间继续保持中立姿态。两秒 blend 可以减小指令跳变，但不能纠正错误的
-目标姿态。输入过期时机器人保持最后一帧实际输出并取消 ARM；新鲜输入恢复后仍需从冻结帧
-再次发送 `btn_10=12`，系统不会自动进入 PD brake，也不会自动恢复人体控制。离开并重新
-进入 ZeroLab 后，必须重新完成一次 T-pose 标定。
+ARM 后的 2.0 秒交接期间继续保持中立姿态。两秒 blend 可以减小指令跳变，但不能纠正错误的
+目标姿态。`ARMED` 输入过期时进入 `HOLD_REFERENCE`：系统保持已接受的人体 reference，
+继续使用 SONIC 与当前本体感知闭环平衡，并非冻结最后一张电机命令。新鲜输入恢复后仍处于
+待授权状态；安全员必须再次发送 `btn_10=12`，系统才在 reference space 内执行 2.0 秒
+`REARMING` 后回到 `ARMED`。系统不会自动进入 PD brake，也不会自动恢复人体控制。
 
-硬件测试仍然禁止，直到 Task 7 的每一项 MuJoCo acceptance item 全部通过。
+MuJoCo acceptance 必须覆盖 0.6 s、2 s 和 30 s 的 dropout：确认 `WAIT_STREAM`/`WAIT_ARM`
+持续实时 Normal、初次 2.0 秒 blend，以及 `HOLD_REFERENCE` 后的显式 rearm。硬件仍然禁止，
+直至这些 MuJoCo acceptance 项全部通过，并且独立确认 CAN 与 `motor_timeout` clearance；
+通过其中一项不解除另一项硬件阻断。
 
 检查状态和三个监听端口：
 

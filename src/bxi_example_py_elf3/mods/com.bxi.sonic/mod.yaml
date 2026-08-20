@@ -300,10 +300,11 @@ states:
       group: Advanced
       icon: accessibility_new
       confirm: true
-      confirm_message: 请先摆好T-pose；进入后保持不动，直到日志显示ZeroLab stream ready
+      confirm_message: >-
+        请先在ZeroLab厂家软件完成N-pose标定并回到中立姿势；进入后等待ZeroLab stream ready
     params:
       operator_prompt: >-
-        T-pose标定期间机器人保持Normal；stream ready后回到中立姿势，等待安全员发送btn_10=12
+        机器人保持实时Normal直到stream ready；确认操作者处于中立姿势后，由安全员发送btn_10=12
       arm_blend_seconds: 2.0
       require_live_reference: false
       yaw_bias_rad: 1.57079632679

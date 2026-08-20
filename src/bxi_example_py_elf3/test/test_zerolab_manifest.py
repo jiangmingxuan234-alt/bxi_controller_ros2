@@ -72,12 +72,18 @@ def test_zerolab_event_state_and_routes_are_safe():
         "value": 12,
     }
     params = manifest["states"]["sonic_zerolab"]["params"]
+    assert manifest["states"]["sonic_zerolab"]["manifest"][
+        "confirm_message"
+    ] == (
+        "请先在ZeroLab厂家软件完成N-pose标定并回到中立姿势；"
+        "进入后等待ZeroLab stream ready"
+    )
     assert params["require_live_reference"] is False
     assert params["head_control_enabled"] is False
     assert params["hardware_gripper"] is False
     assert params["operator_prompt"] == (
-        "T-pose标定期间机器人保持Normal；stream ready后回到中立姿势，"
-        "等待安全员发送btn_10=12"
+        "机器人保持实时Normal直到stream ready；确认操作者处于中立姿势后，"
+        "由安全员发送btn_10=12"
     )
     assert params["arm_blend_seconds"] == 2.0
     routes = {(r["from"], r["event"], r["to"]) for r in manifest["routes"]}
@@ -196,8 +202,8 @@ def test_source_prompts_and_zerolab_availability_without_live_data():
         normal_context.finish()
 
         prompt = (
-            "T-pose标定期间机器人保持Normal；stream ready后回到中立姿势，"
-            "等待安全员发送btn_10=12"
+            "机器人保持实时Normal直到stream ready；确认操作者处于中立姿势后，"
+            "由安全员发送btn_10=12"
         )
         zero_context = StateBuildContext(
             "com.bxi.sonic/sonic_zerolab",
@@ -235,7 +241,7 @@ def test_source_prompts_and_zerolab_availability_without_live_data():
         zero.on_prepare(EntryLifecycleContext(), object())
         zero.on_enter(None)
         assert logger.messages == [
-            "ZeroLab ARM phase: WAIT_CALIBRATION",
+            "ZeroLab ARM phase: WAIT_STREAM",
             "ZeroLab pre-ARM output: live zero-command Normal policy",
             "SONIC遥操已启动；头部跟踪已关闭；" + prompt,
         ]
@@ -256,3 +262,20 @@ def test_process_loader_imports_zerolab_source_with_dynamic_package():
         assert spec.params["pose_port"] == 5558
     finally:
         _remove_module_prefixes((module_prefix,))
+
+
+def test_zerolab_sources_and_manifest_avoid_runtime_tpose_calibration():
+    legacy_terms = ("TPoseCalibrator", "T-pose标定")
+    for relative_path in (
+        "zerolab/converter.py",
+        "zerolab/source_node.py",
+        "zerolab/state.py",
+    ):
+        source = (MOD_ROOT / relative_path).read_text(encoding="utf-8")
+        assert not any(term in source for term in legacy_terms)
+
+    zerolab_manifest = yaml.safe_dump(
+        load_manifest()["states"]["sonic_zerolab"],
+        allow_unicode=True,
+    )
+    assert not any(term in zerolab_manifest for term in legacy_terms)
