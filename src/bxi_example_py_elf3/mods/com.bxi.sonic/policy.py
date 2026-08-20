@@ -33,6 +33,7 @@ from bxi_example_py_elf3.framework.joints import JointParameterSet
 from bxi_example_py_elf3.framework.mod_api import LoggerLike
 from bxi_example_py_elf3.policies.joints import ELF3_POLICY_JOINTS
 
+from .reference_gate import SmplReferenceFrame
 from .pico.runtime_config import SMPL_REF_HOST, SMPL_REF_PORT, SMPL_REF_TOPIC
 from .pico.streamed_smpl_ref import (
     IncomingChunk,
@@ -96,25 +97,6 @@ SONIC_PARAMETERS = JointParameterSet.from_rows(
         ("r_wrist_z_joint", 0.0, 16.747, 1.066, 0.37320117),
     ),
 )
-
-
-@dataclass
-class SmplReferenceFrame:
-    term1_local: np.ndarray
-    root_quat: np.ndarray
-    wrist: np.ndarray
-    head_joint_pos: np.ndarray
-    anchor_quat: Optional[np.ndarray] = None
-    frame_index: int = -1
-    sequence: int = 0
-    stream_epoch: Optional[int] = None
-    source_stale: bool = False
-    source_age_ms: Optional[float] = None
-    playback_hold: bool = False
-    newest_frame_index: int = -1
-    lead_frames: int = -1
-    valid_horizon: int = 0
-    clamp_slots: int = -1
 
 
 @dataclass(frozen=True, slots=True)
