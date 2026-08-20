@@ -33,7 +33,11 @@ from bxi_example_py_elf3.framework.joints import JointParameterSet
 from bxi_example_py_elf3.framework.mod_api import LoggerLike
 from bxi_example_py_elf3.policies.joints import ELF3_POLICY_JOINTS
 
-from .reference_gate import SmplReferenceFrame
+from .reference_gate import (
+    LiveReferenceGate,
+    ReferenceGateMode,
+    SmplReferenceFrame,
+)
 from .pico.runtime_config import SMPL_REF_HOST, SMPL_REF_PORT, SMPL_REF_TOPIC
 from .pico.streamed_smpl_ref import (
     IncomingChunk,
@@ -356,6 +360,7 @@ class SonicTeleopPolicy(JointPolicy):
         self.live_reference_protocol = "none"
         self.active_reference_kind = "none"
         self.latest_live_ref: Optional[SmplReferenceFrame] = None
+        self._live_reference_gate = LiveReferenceGate()
         self.head_joint_target = np.zeros(2, dtype=np.float32)
         self.latest_live_ref_time = 0.0
         self.live_sequence = 0
@@ -612,6 +617,7 @@ class SonicTeleopPolicy(JointPolicy):
         self.live_reference_protocol = "none"
         self.active_reference_kind = "none"
         self.latest_live_ref = None
+        self._live_reference_gate.reset()
         self.head_joint_target.fill(0.0)
         self.latest_live_ref_time = 0.0
         self.live_sequence = 0
@@ -637,6 +643,20 @@ class SonicTeleopPolicy(JointPolicy):
             self.latest_live_ref is not None
             and time.monotonic() - self.latest_live_ref_time <= timeout
         )
+
+    def hold_live_reference(self) -> bool:
+        self.poll_reference()
+        return self._live_reference_gate.hold()
+
+    def begin_live_reference_rearm(self) -> bool:
+        self.poll_reference()
+        return self._live_reference_gate.begin_rearm()
+
+    def set_live_reference_rearm_progress(self, alpha: float) -> None:
+        self._live_reference_gate.set_rearm_progress(alpha)
+
+    def complete_live_reference_rearm(self) -> None:
+        self._live_reference_gate.complete_rearm()
 
     def reset_yaw_alignment(self) -> None:
         self.yaw_aligned = False
@@ -709,6 +729,10 @@ class SonicTeleopPolicy(JointPolicy):
             self.live_reference_protocol = "legacy_window"
             self.latest_live_ref = frame
             self.latest_live_ref_time = received_mono
+            self._live_reference_gate.observe(
+                self.latest_live_ref,
+                self.latest_live_ref_time,
+            )
 
         if self.stream_merger.timesteps >= WINDOW:
             age_s = max(0.0, time.monotonic() - self.last_source_rx_mono)
@@ -723,6 +747,10 @@ class SonicTeleopPolicy(JointPolicy):
                 self.live_reference_protocol = "source_chunk"
                 self.latest_live_ref = self._frame_from_fields(fields)
                 self.latest_live_ref_time = self.last_source_rx_mono
+                self._live_reference_gate.observe(
+                    self.latest_live_ref,
+                    self.latest_live_ref_time,
+                )
         return self.latest_live_ref
 
     @staticmethod
@@ -924,7 +952,8 @@ class SonicTeleopPolicy(JointPolicy):
         )
 
     def _active_reference(self) -> tuple[SmplReferenceFrame, str, float]:
-        live = self.poll_reference()
+        self.poll_reference()
+        live = self._live_reference_gate.active_reference()
         now_mono = time.monotonic()
         if live is not None:
             if live.stream_epoch is not None and live.stream_epoch != self.stream_epoch:
@@ -1091,11 +1120,16 @@ class SonicTeleopPolicy(JointPolicy):
         ).astype(np.float32)
         self.policy_active = True
         if source == "live":
-            self.last_status = (
-                "stale_hold"
-                if self.live_reference_stale
-                else "live_reference"
-            )
+            if self._live_reference_gate.mode is ReferenceGateMode.HOLD:
+                self.last_status = "held_reference"
+            elif self._live_reference_gate.mode is ReferenceGateMode.REARMING:
+                self.last_status = "rearming_reference"
+            else:
+                self.last_status = (
+                    "stale_hold"
+                    if self.live_reference_stale
+                    else "live_reference"
+                )
         else:
             self.last_status = "idle_reference"
         if self.last_status != self._reported_status:

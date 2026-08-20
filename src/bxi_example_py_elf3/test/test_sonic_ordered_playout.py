@@ -305,6 +305,54 @@ def test_policy_holds_last_complete_window_after_disconnect(monkeypatch):
     assert int(policy._backend.inputs[-1][0, 0]) == 4
 
 
+def test_policy_hold_keeps_reference_but_continues_inference(monkeypatch):
+    policy = _make_policy(monkeypatch)
+    now = time.monotonic()
+    policy._merge_source_fields(_source_fields(0), now)
+    policy.inference_step(*_observation())
+    held_term = policy._backend.inputs[-1][0, 0]
+    calls = len(policy._backend.inputs)
+
+    assert policy.hold_live_reference() is True
+    policy._merge_source_fields(_source_fields(100), now + 0.1)
+    policy.inference_step(*_observation())
+
+    assert len(policy._backend.inputs) == calls + 1
+    assert policy._backend.inputs[-1][0, 0] == held_term
+    assert policy.has_fresh_live_reference(0.5)
+    assert policy.last_status == "held_reference"
+
+
+def test_policy_rearm_exposes_interpolated_reference(monkeypatch):
+    policy = _make_policy(monkeypatch)
+    now = time.monotonic()
+    policy._merge_source_fields(_source_fields(0), now)
+    policy.inference_step(*_observation())
+    policy.hold_live_reference()
+    policy._merge_source_fields(_source_fields(10, epoch=2), now + 0.1)
+    assert policy.begin_live_reference_rearm() is True
+    policy.set_live_reference_rearm_progress(0.5)
+
+    policy.inference_step(*_observation())
+
+    assert policy._backend.inputs[-1][0, 0] == pytest.approx(5.0)
+    assert policy.last_status == "rearming_reference"
+    policy.complete_live_reference_rearm()
+    assert policy._live_reference_gate.mode.name == "LIVE"
+
+
+def test_policy_reset_returns_reference_gate_to_live(monkeypatch):
+    policy = _make_policy(monkeypatch)
+    policy._merge_source_fields(_source_fields(0), time.monotonic())
+    policy.inference_step(*_observation())
+    assert policy.hold_live_reference() is True
+    assert policy._live_reference_gate.mode.name == "HOLD"
+
+    policy.reset()
+
+    assert policy._live_reference_gate.mode.name == "LIVE"
+
+
 def test_backend_failure_does_not_advance_policy_cursor(monkeypatch):
     policy = _make_policy(monkeypatch)
     now = time.monotonic()
