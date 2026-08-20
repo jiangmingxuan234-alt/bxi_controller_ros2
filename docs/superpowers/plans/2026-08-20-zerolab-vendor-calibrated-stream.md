@@ -97,7 +97,7 @@ print(f'LEGACY_OUTPUT_FRAMES={len(indices)} FIRST={indices[0]} LAST={indices[-1]
 PY
 ```
 
-Expected: `LEGACY_OUTPUT_FRAMES` is positive, the first output index is 100 frames later than the recording's first packet, and `/tmp/zerolab-legacy-conversion.npz` exists.
+Expected: `LEGACY_OUTPUT_FRAMES` is positive and `/tmp/zerolab-legacy-conversion.npz` exists. The legacy converter requires a 100-frame stable window, but its >5-degree stability check can reset that window, so the first output may be later than frame 100; this supplied recording legitimately produces `FIRST=184` (the recording begins at frame 0).
 
 - [ ] **Step 2: Write direct-conversion failing tests**
 
