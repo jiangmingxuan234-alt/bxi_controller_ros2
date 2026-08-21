@@ -533,10 +533,11 @@ reference 时进入。因为可用性检查发生在 state-scoped 节点 prepare
 需要把 `pico_manager` 和 `smpl_bridge` 都改成 `lifecycle: mod`，让 PICO 数据流在状态
 切换请求之前已经运行。
 
-## ZeroLab 实时 MuJoCo 遥操
+## ZeroLab 实时遥操（ELF3 网线适配）
 
-固定条件：MotionCaptureMaster 关闭镜像；Windows 发送端为 `192.168.89.171`；以
-50 Hz、每包 992 字节向 Ubuntu `192.168.88.161:18000` 发送 UDP。开始前必须在
+当前 ELF3 网线适配固定条件：MotionCaptureMaster 关闭镜像；Windows 有线端为
+`192.168.1.52`；以 50 Hz、每包 992 字节向机器人 Ubuntu
+`192.168.1.51:18000` 发送 UDP。开始前必须在
 ZeroLab 厂家软件完成 N-pose 标定并回到中立姿势；UDP 的 world quaternion 已是厂家
 标定后的数据。应用不执行运行时 T-pose、静止姿势或其他人体重标定。ZeroLab 状态使用
 `btn_10=11`，不会启动 PICO manager、RoboticsService、RTSP 或夹爪/头部控制；PICO

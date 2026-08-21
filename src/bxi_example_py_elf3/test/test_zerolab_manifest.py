@@ -40,7 +40,7 @@ def test_zerolab_nodes_have_distinct_upstream_and_mutually_exclusive_states():
     assert nodes["zerolab_source"]["runtime_profile"] == "host_ros"
     assert nodes["zerolab_source"]["params"]["udp_port"] == 18000
     assert nodes["zerolab_source"]["params"]["allowed_sender"] == (
-        "192.168.89.171"
+        "192.168.1.52"
     )
     assert nodes["zerolab_source"]["params"]["pose_host"] == "127.0.0.1"
     assert nodes["zerolab_source"]["params"]["pose_port"] == 5558
