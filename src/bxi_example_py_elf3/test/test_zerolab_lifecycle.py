@@ -1,3 +1,4 @@
+from copy import deepcopy
 from pathlib import Path
 import socket
 import time
@@ -18,6 +19,7 @@ from bxi_example_py_elf3.framework.runtime.mod_nodes import (
 )
 from pico.pose_to_smpl_ref_bridge import SmplRefBridgeNode
 from zerolab.converter import ZeroLabMotionConverter
+from zerolab.resampler import ZeroLabPoseResampler
 from zerolab.source_node import (
     ZeroLabSourceCore,
     ZeroLabSourceNode,
@@ -215,12 +217,10 @@ class ControlledReceiver:
 
 class CapturingPublisher:
     def __init__(self):
-        self.frame_indices = []
-        self.frame_windows = []
+        self.messages = []
 
     def send(self, fields):
-        self.frame_indices.append(int(fields["frame_index"][-1]))
-        self.frame_windows.append(np.asarray(fields["frame_index"]).copy())
+        self.messages.append(deepcopy(fields))
 
 
 class CapturingLogger:
@@ -255,6 +255,190 @@ def identity_payload():
     )
 
 
+def make_test_core():
+    generations = iter((101, 202, 303))
+    return ZeroLabSourceCore(
+        ZeroLabMotionConverter(),
+        resampler=ZeroLabPoseResampler(
+            jitter_buffer_seconds=0.08,
+            short_recovery_blend_seconds=0.2,
+            output_rate_hz=50.0,
+        ),
+        window_frames=10,
+        stale_seconds=0.5,
+        recovery_real_frames=10,
+        generation_factory=lambda _previous=None: next(generations),
+    )
+
+
+def make_controlled_node(monkeypatch):
+    clock_ns = [0]
+    monkeypatch.setattr(
+        "zerolab.source_node.time.monotonic_ns", lambda: clock_ns[0]
+    )
+    receiver = ControlledReceiver(identity_payload())
+    publisher = CapturingPublisher()
+    logger = CapturingLogger()
+    node = ZeroLabSourceNode.__new__(ZeroLabSourceNode)
+    node._closed = False
+    node._receiver = receiver
+    node._converter = ZeroLabMotionConverter()
+    node._core = make_test_core()
+    node._publisher = publisher
+    node._writer = None
+    node._recording_enabled = False
+    node._recording_error_reported = False
+    node._invalid_packets = 0
+    node._dropped_publications = 0
+    node._stream_state = None
+    node._last_stale_log_generation = None
+    node._last_stats_log_ns = 0
+    node.get_logger = lambda: logger
+    return node, receiver, publisher, clock_ns
+
+
+def ready_controlled_node(monkeypatch):
+    node, receiver, publisher, clock_ns = make_controlled_node(monkeypatch)
+    for index in range(10):
+        clock_ns[0] = 80_000_000 + index * 20_000_000
+        receiver.queue(index, index * 20_000_000)
+        node._tick()
+    assert any(int(msg["real_stream_ready"][0]) for msg in publisher.messages)
+    return node, receiver, publisher, clock_ns
+
+
+def create_stale_then_ten_real_recovery(node, receiver, clock_ns):
+    clock_ns[0] += 500_000_001
+    node._tick()
+    recovery_start = clock_ns[0] + 20_000_000
+    for offset in range(10):
+        timestamp_ns = recovery_start + offset * 20_000_000
+        receiver.queue(100 + offset, timestamp_ns)
+        clock_ns[0] = timestamp_ns + 80_000_000
+        node._tick()
+
+
+def test_node_drains_burst_but_publishes_at_most_once_per_tick(monkeypatch):
+    node, receiver, publisher, clock = ready_controlled_node(monkeypatch)
+    initial_publications = len(publisher.messages)
+    for index in range(10, 40):
+        receiver.queue(index, index * 20_000_000)
+    clock[0] = 860_000_000
+    node._tick()
+    assert receiver.pending == []
+    assert node._core.stats.real_valid_packets == 40
+    assert len(publisher.messages) == initial_publications + 1
+
+
+def test_node_keeps_50_hz_stale_held_publication_with_stale_metadata(
+    monkeypatch,
+):
+    node, receiver, publisher, clock = ready_controlled_node(monkeypatch)
+    initial_publications = len(publisher.messages)
+    clock[0] += 500_000_001
+    node._tick()
+    for _ in range(12):
+        clock[0] += 20_000_000
+        node._tick()
+    stale_messages = publisher.messages[initial_publications:]
+    assert len(stale_messages) == 13
+    assert [
+        int(message["frame_index"][-1]) for message in stale_messages
+    ] == list(range(10, 23))
+    assert all(
+        int(msg["real_stream_ready"][0]) == 0
+        and int(msg["source_stale"][0]) == 1
+        and int(msg["playout_kind"][0]) == 2
+        for msg in stale_messages
+    )
+
+
+def test_stale_log_precedes_recovery_ready_and_is_rate_limited(monkeypatch):
+    node, receiver, publisher, clock = ready_controlled_node(monkeypatch)
+    create_stale_then_ten_real_recovery(node, receiver, clock)
+    stale = [
+        event for event in node.get_logger().events if "input stale" in event[1]
+    ]
+    ready = [
+        event for event in node.get_logger().events if "stream ready" in event[1]
+    ]
+    assert len(stale) == 1
+    assert node.get_logger().events.index(
+        stale[0]
+    ) < node.get_logger().events.index(ready[-1])
+
+
+def test_stale_transition_logs_once_for_each_source_generation(monkeypatch):
+    node, receiver, _publisher, clock = ready_controlled_node(monkeypatch)
+    stats_before = sum(
+        "source stats" in message for message in node.get_logger().infos
+    )
+    first_gap_packet_ns = (
+        node._core.latest_real_receive_timestamp_ns + 500_000_001
+    )
+    receiver.queue(10, first_gap_packet_ns)
+    clock[0] = first_gap_packet_ns + 80_000_000
+    node._tick()
+    assert node._core.source_generation == 202
+
+    clock[0] = first_gap_packet_ns + 500_000_001
+    node._tick()
+
+    assert node._core.source_generation == 303
+    stale = [
+        event for event in node.get_logger().events if "input stale" in event[1]
+    ]
+    assert len(stale) == 2
+    stats_after = sum(
+        "source stats" in message for message in node.get_logger().infos
+    )
+    assert stats_after == stats_before + 2
+
+
+def test_source_statistics_are_bounded_to_five_seconds_and_include_counters(
+    monkeypatch,
+):
+    node, receiver, _publisher, clock = ready_controlled_node(monkeypatch)
+    node.get_logger().infos.clear()
+    node.get_logger().events.clear()
+    stats_start_ns = clock[0]
+    node._last_stats_log_ns = stats_start_ns
+    latest_real_ns = node._core.latest_real_receive_timestamp_ns
+
+    for offset in range(1, 13):
+        timestamp_ns = latest_real_ns + offset * 400_000_000
+        receiver.queue(9 + offset, timestamp_ns)
+        clock[0] = timestamp_ns + 80_000_000
+        node._tick()
+    assert not any("source stats" in message for message in node.get_logger().infos)
+
+    clock[0] = stats_start_ns + 5_000_000_000
+    node._tick()
+    stats = [
+        message
+        for message in node.get_logger().infos
+        if "source stats" in message
+    ]
+    assert len(stats) == 1
+    for counter in (
+        "real_valid_packets=22",
+        "maximum_real_arrival_gap_ms=400.000",
+        "stale_events=0",
+        "interpolated_output_frames=",
+        "held_output_frames=",
+        "dropped_backlog_frames=",
+        "invalid_packets=0",
+        "dropped_publications=0",
+    ):
+        assert counter in stats[0]
+
+    clock[0] += 20_000_000
+    node._tick()
+    assert sum(
+        "source stats" in message for message in node.get_logger().infos
+    ) == 1
+
+
 class RejectMalformedCore:
     def accept(self, _packet):
         raise AssertionError("malformed packet reached core.accept")
@@ -264,6 +448,9 @@ class RejectMalformedCore:
 
     def consume_stale_event(self):
         return False
+
+    def sample(self, _now_ns):
+        return None
 
 
 def test_malformed_packet_never_reaches_core_accept(monkeypatch):
@@ -280,7 +467,8 @@ def test_malformed_packet_never_reaches_core_accept(monkeypatch):
     node._recording_enabled = False
     node._invalid_packets = 0
     node._dropped_publications = 0
-    node._stream_state = None
+    node._stream_state = "collecting"
+    node._last_stats_log_ns = 0
     node.get_logger = lambda: logger
 
     node._tick()
@@ -292,80 +480,26 @@ def test_malformed_packet_never_reaches_core_accept(monkeypatch):
 def test_executor_gap_logs_stale_once_then_ready_once_after_refill(
     monkeypatch,
 ):
-    clock_ns = [0]
-    monkeypatch.setattr(
-        "zerolab.source_node.time.monotonic_ns", lambda: clock_ns[0]
-    )
-    receiver = ControlledReceiver(identity_payload())
-    publisher = CapturingPublisher()
-    logger = CapturingLogger()
-    node = ZeroLabSourceNode.__new__(ZeroLabSourceNode)
-    node._closed = False
-    node._receiver = receiver
-    node._converter = ZeroLabMotionConverter()
-    node._core = ZeroLabSourceCore(node._converter)
-    node._publisher = publisher
-    node._writer = None
-    node._recording_enabled = False
-    node._invalid_packets = 0
-    node._dropped_publications = 0
-    node._stream_state = None
-    node.get_logger = lambda: logger
+    node, receiver, publisher, clock_ns = ready_controlled_node(monkeypatch)
 
-    for frame_index in range(10):
-        clock_ns[0] = frame_index * 20_000_000
-        receiver.queue(frame_index, clock_ns[0])
-        node._tick()
+    create_stale_then_ten_real_recovery(node, receiver, clock_ns)
 
-    assert publisher.frame_indices == [9]
-    assert logger.infos.count("ZeroLab stream ready; frame=9") == 1
-
-    clock_ns[0] += 500_000_001
-    receiver.queue(10, clock_ns[0])
-    node._tick()
-    node._tick()
-
-    stale_message = "ZeroLab input stale; live pose publication stopped"
-    assert logger.warnings.count(stale_message) == 1
-
-    gap_timestamp_ns = clock_ns[0]
-    for frame_index in range(11, 20):
-        clock_ns[0] = gap_timestamp_ns + (frame_index - 10) * 20_000_000
-        receiver.queue(frame_index, clock_ns[0])
-        node._tick()
-    node._tick()
-
-    assert publisher.frame_indices == [9, 19]
-    assert logger.warnings.count(stale_message) == 1
-    assert logger.infos.count("ZeroLab stream ready; frame=19") == 1
-    assert logger.infos.count("ZeroLab waiting for 10-frame stream window") == 2
+    stale_message = "ZeroLab input stale; holding playout with source_stale=1"
+    assert node.get_logger().warnings.count(stale_message) == 1
+    ready = [
+        message
+        for message in node.get_logger().infos
+        if "ZeroLab stream ready" in message
+    ]
+    assert len(ready) == 2
+    assert "generation=202 real_frames=10" in ready[-1]
+    assert int(publisher.messages[-1]["source_generation"][0]) == 202
+    assert int(publisher.messages[-1]["real_stream_ready"][0]) == 1
 
 
 def test_executor_gap_backlog_logs_stale_before_same_tick_ready(monkeypatch):
-    clock_ns = [0]
-    monkeypatch.setattr(
-        "zerolab.source_node.time.monotonic_ns", lambda: clock_ns[0]
-    )
-    receiver = ControlledReceiver(identity_payload())
-    publisher = CapturingPublisher()
-    logger = CapturingLogger()
-    node = ZeroLabSourceNode.__new__(ZeroLabSourceNode)
-    node._closed = False
-    node._receiver = receiver
-    node._converter = ZeroLabMotionConverter()
-    node._core = ZeroLabSourceCore(node._converter)
-    node._publisher = publisher
-    node._writer = None
-    node._recording_enabled = False
-    node._invalid_packets = 0
-    node._dropped_publications = 0
-    node._stream_state = None
-    node.get_logger = lambda: logger
-
-    for frame_index in range(10):
-        clock_ns[0] = frame_index * 20_000_000
-        receiver.queue(frame_index, clock_ns[0])
-        node._tick()
+    node, receiver, publisher, clock_ns = ready_controlled_node(monkeypatch)
+    initial_publications = len(publisher.messages)
 
     pre_gap_timestamp_ns = clock_ns[0] + 20_000_000
     receiver.queue(10, pre_gap_timestamp_ns)
@@ -374,19 +508,24 @@ def test_executor_gap_backlog_logs_stale_before_same_tick_ready(monkeypatch):
         timestamp_ns = gap_timestamp_ns + (frame_index - 11) * 20_000_000
         receiver.queue(frame_index, timestamp_ns)
         clock_ns[0] = timestamp_ns
+    clock_ns[0] += 80_000_000
     node._tick()
-    node._tick()
+    assert len(publisher.messages) <= initial_publications + 1
+    for _ in range(9):
+        clock_ns[0] += 20_000_000
+        node._tick()
 
-    stale_message = "ZeroLab input stale; live pose publication stopped"
-    assert publisher.frame_indices == [9, 20]
-    np.testing.assert_array_equal(
-        publisher.frame_windows[-1], np.arange(11, 21)
+    stale_message = "ZeroLab input stale; holding playout with source_stale=1"
+    assert node.get_logger().warnings.count(stale_message) == 1
+    assert int(publisher.messages[-1]["latest_real_frame_index"][0]) == 20
+    assert int(publisher.messages[-1]["source_generation"][0]) == 202
+    assert int(publisher.messages[-1]["real_stream_ready"][0]) == 1
+    stale_event = node.get_logger().events.index(("warning", stale_message))
+    ready_event = next(
+        index
+        for index, event in enumerate(node.get_logger().events)
+        if index > stale_event and "stream ready" in event[1]
     )
-    assert logger.warnings.count(stale_message) == 1
-    ready_message = "ZeroLab stream ready; frame=20"
-    assert logger.infos.count(ready_message) == 1
-    stale_event = logger.events.index(("warning", stale_message))
-    ready_event = logger.events.index(("info", ready_message))
     assert stale_event < ready_event
     assert node._stream_state == "ready"
 

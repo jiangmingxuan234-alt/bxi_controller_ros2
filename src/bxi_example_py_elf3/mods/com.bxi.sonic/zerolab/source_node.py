@@ -283,6 +283,7 @@ class ZeroLabSourceCore:
         self._real_valid_frames_in_generation = 0
         self._source_stale = False
         self._stale_event_pending = False
+        self._last_complete_window_fields = None
         self._stats = ZeroLabSourceStats()
 
     @property
@@ -313,6 +314,26 @@ class ZeroLabSourceCore:
     @property
     def stats(self) -> ZeroLabSourceStats:
         return self._stats
+
+    def _advance_last_complete_window(self, frame):
+        if self._last_complete_window_fields is None:
+            return None
+        fields = {
+            name: np.array(values, copy=True)
+            for name, values in self._last_complete_window_fields.items()
+        }
+        fields["frame_index"][:-1] = fields["frame_index"][1:].copy()
+        fields["frame_index"][-1] = frame.frame_index
+        for name in ("smpl_joints", "body_quat_w", "joint_pos"):
+            fields[name][:-1] = fields[name][1:].copy()
+            fields[name][-1] = getattr(frame, name)
+        fields["head_joint_pos"][:-1] = fields["head_joint_pos"][1:].copy()
+        fields["head_joint_pos"][-1] = 0.0
+        self._last_complete_window_fields = {
+            name: np.array(values, copy=True)
+            for name, values in fields.items()
+        }
+        return fields
 
     def _mark_stale(self) -> None:
         self._window.clear()
@@ -373,7 +394,14 @@ class ZeroLabSourceCore:
             return None
         fields = self._window.append(resampled.frame)
         if fields is None:
-            return None
+            fields = self._advance_last_complete_window(resampled.frame)
+            if fields is None:
+                return None
+        else:
+            self._last_complete_window_fields = {
+                name: np.array(values, copy=True)
+                for name, values in fields.items()
+            }
 
         source_stale = self._source_stale
         if self._latest_real_receive_timestamp_ns is not None:
@@ -488,6 +516,8 @@ class ZeroLabSourceNode(Node):
         self._invalid_packets = 0
         self._dropped_publications = 0
         self._stream_state = None
+        self._last_stale_log_generation = None
+        self._last_stats_log_ns = 0
         self._closed = False
         self._destroy_result = True
 
@@ -596,28 +626,58 @@ class ZeroLabSourceNode(Node):
             self._disable_recording(exc)
 
     def _set_stream_state(
-        self, state: str, *, frame_index: int | None = None
-    ) -> None:
-        if state == self._stream_state:
-            return
+        self,
+        state: str,
+        *,
+        frame_index: int | None = None,
+        generation: int | None = None,
+        real_frames: int | None = None,
+    ) -> bool:
+        if state == "stale":
+            stale_generation = self._core.source_generation
+            if stale_generation == self._last_stale_log_generation:
+                return False
+            self._last_stale_log_generation = stale_generation
+        elif state == self._stream_state:
+            return False
         self._stream_state = state
         if state == "collecting":
             self.get_logger().info("ZeroLab waiting for 10-frame stream window")
         elif state == "ready":
             self.get_logger().info(
-                f"ZeroLab stream ready; frame={frame_index}"
+                f"ZeroLab stream ready; frame={frame_index} "
+                f"generation={generation} real_frames={real_frames}"
             )
         elif state == "stale":
             self.get_logger().warning(
-                "ZeroLab input stale; live pose publication stopped"
+                "ZeroLab input stale; holding playout with source_stale=1"
             )
+        return True
+
+    def _log_stats(self, now_ns: int, *, force: bool = False) -> None:
+        if not force and now_ns - self._last_stats_log_ns < 5_000_000_000:
+            return
+        source_stats = self._core.stats
+        resampler_stats = self._core._resampler.stats
+        self.get_logger().info(
+            "ZeroLab source stats; "
+            f"real_valid_packets={source_stats.real_valid_packets} "
+            "maximum_real_arrival_gap_ms="
+            f"{source_stats.maximum_real_arrival_gap_ms:.3f} "
+            f"stale_events={source_stats.stale_events} "
+            "interpolated_output_frames="
+            f"{resampler_stats.interpolated_output_frames} "
+            f"held_output_frames={resampler_stats.held_output_frames} "
+            f"dropped_backlog_frames={resampler_stats.dropped_backlog_frames} "
+            f"invalid_packets={self._invalid_packets} "
+            f"dropped_publications={self._dropped_publications}"
+        )
+        self._last_stats_log_ns = now_ns
 
     def _tick(self) -> None:
         if self._closed:
             return
-        latest_fields = None
         received_valid = False
-        became_stale = False
         for datagram in self._receiver.drain():
             try:
                 packet = parse_zerolab_packet(
@@ -634,28 +694,27 @@ class ZeroLabSourceNode(Node):
                 continue
             received_valid = True
             self._record_valid_packet_if_enabled(packet)
-            fields = self._core.accept(packet)
-            if self._core.consume_stale_event():
-                became_stale = True
-                latest_fields = None
-            if fields is not None:
-                latest_fields = fields
+            self._core.accept(packet)
 
-        self._core.check_stale(time.monotonic_ns())
-        if self._core.consume_stale_event():
-            became_stale = True
-            latest_fields = None
-        if became_stale:
-            self._set_stream_state("stale")
-        if latest_fields is not None:
+        now_ns = time.monotonic_ns()
+        self._core.check_stale(now_ns)
+        became_stale = self._core.consume_stale_event()
+        fields = self._core.sample(now_ns)
+        if fields is not None:
             try:
-                self._publisher.send(latest_fields)
+                self._publisher.send(fields)
             except zmq.Again:
                 self._dropped_publications += 1
 
-        if latest_fields is not None:
-            self._set_stream_state(
-                "ready", frame_index=int(latest_fields["frame_index"][-1])
+        transitioned = False
+        if became_stale:
+            transitioned = self._set_stream_state("stale")
+        if fields is not None and int(fields["real_stream_ready"][0]):
+            transitioned = self._set_stream_state(
+                "ready",
+                frame_index=int(fields["frame_index"][-1]),
+                generation=int(fields["source_generation"][0]),
+                real_frames=int(fields["real_valid_frames_in_generation"][0]),
             )
         elif (
             not became_stale
@@ -664,7 +723,8 @@ class ZeroLabSourceNode(Node):
                 or (received_valid and self._stream_state == "stale")
             )
         ):
-            self._set_stream_state("collecting")
+            transitioned = self._set_stream_state("collecting")
+        self._log_stats(now_ns, force=transitioned)
 
     def _close_with_warning(self, name: str, close_resource) -> None:
         try:
