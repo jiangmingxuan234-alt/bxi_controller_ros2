@@ -31,6 +31,7 @@ def load_manifest():
 def test_zerolab_nodes_have_distinct_upstream_and_mutually_exclusive_states():
     manifest = load_manifest()
     nodes = manifest["nodes"]
+    source = nodes["zerolab_source"]["params"]
     assert set(nodes["pico_manager"]["states"]) == {"sonic_teleop"}
     assert set(nodes["smpl_bridge"]["states"]) == {"sonic_teleop"}
     assert set(nodes["zerolab_source"]["states"]) == {"sonic_zerolab"}
@@ -38,12 +39,14 @@ def test_zerolab_nodes_have_distinct_upstream_and_mutually_exclusive_states():
     assert nodes["zerolab_source"]["runtime"] == "python"
     assert nodes["zerolab_source"]["execution"] == "process"
     assert nodes["zerolab_source"]["runtime_profile"] == "host_ros"
-    assert nodes["zerolab_source"]["params"]["udp_port"] == 18000
-    assert nodes["zerolab_source"]["params"]["allowed_sender"] == (
-        "192.168.1.52"
-    )
-    assert nodes["zerolab_source"]["params"]["pose_host"] == "127.0.0.1"
-    assert nodes["zerolab_source"]["params"]["pose_port"] == 5558
+    assert source["udp_port"] == 18000
+    assert source["allowed_sender"] == "192.168.89.171"
+    assert source["pose_host"] == "127.0.0.1"
+    assert source["pose_port"] == 5558
+    assert source["jitter_buffer_seconds"] == 0.08
+    assert source["short_recovery_blend_seconds"] == 0.2
+    assert source["stale_seconds"] == 0.5
+    assert source["recovery_real_frames"] == 10
     assert (
         nodes["zerolab_bridge"]["entrypoint"]
         == "pico.pose_to_smpl_ref_bridge:create_node"
@@ -86,6 +89,9 @@ def test_zerolab_event_state_and_routes_are_safe():
         "由安全员发送btn_10=12"
     )
     assert params["arm_blend_seconds"] == 2.0
+    assert params["auto_rearm_on_recovery"] is True
+    assert params["auto_rearm_blend_seconds"] == 2.0
+    assert params["recovery_real_frames"] == 10
     routes = {(r["from"], r["event"], r["to"]) for r in manifest["routes"]}
     assert (
         "com.bxi.basic_actions/normal",
@@ -214,6 +220,9 @@ def test_source_prompts_and_zerolab_availability_without_live_data():
                 "head_control_enabled": False,
                 "hardware_gripper": False,
                 "arm_blend_seconds": 2.0,
+                "auto_rearm_on_recovery": True,
+                "auto_rearm_blend_seconds": 2.0,
+                "recovery_real_frames": 10,
             },
         )
         zero = definition.state_factories["sonic_zerolab"](zero_context)
@@ -231,6 +240,9 @@ def test_source_prompts_and_zerolab_availability_without_live_data():
         assert zero._normal_policy.key == normal._policy.key
         assert type(zero).__name__ == "ZeroLabArmedTeleopState"
         assert zero.arm_blend_seconds == 2.0
+        assert zero.auto_rearm_on_recovery is True
+        assert zero.auto_rearm_blend_seconds == 2.0
+        assert zero.recovery_real_frames == 10
         assert zero._policy is pico._policy
         assert zero.require_live_reference is False
         assert zero.hardware_gripper is False

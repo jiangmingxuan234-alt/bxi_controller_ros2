@@ -142,6 +142,13 @@ def _build_zerolab_state(
         policy,
         normal_policy=normal_policy,
         arm_blend_seconds=state.float_param("arm_blend_seconds", 2.0),
+        auto_rearm_on_recovery=state.bool_param(
+            "auto_rearm_on_recovery", True
+        ),
+        auto_rearm_blend_seconds=state.float_param(
+            "auto_rearm_blend_seconds", 2.0
+        ),
+        recovery_real_frames=state.int_param("recovery_real_frames", 10),
         **_common_state_kwargs(state),
     )
 

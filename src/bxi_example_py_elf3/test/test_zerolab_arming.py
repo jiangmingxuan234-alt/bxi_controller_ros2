@@ -52,10 +52,13 @@ class FakePolicy:
         self.output = PolicyOutput(target.view)
         self.target = target
         self.fresh = False
+        self.recovery_ready = False
         self.step_calls = 0
         self.held = False
         self.rearming = False
+        self.rearm_attempts = 0
         self.rearm_progress = 0.0
+        self.held_rearm_progress = None
         self.rearm_progress_at_step = []
         self.head_joint_target = np.zeros(2, dtype=np.float32)
         self.last_status = "idle_reference"
@@ -79,7 +82,12 @@ class FakePolicy:
     def has_fresh_live_reference(self, _timeout_s=None):
         return self.fresh
 
+    def live_reference_recovery_ready(self, required_real_frames):
+        assert required_real_frames == 10
+        return self.fresh and self.recovery_ready
+
     def hold_live_reference(self):
+        self.held_rearm_progress = self.rearm_progress
         self.held = True
         self.rearming = False
         return True
@@ -88,6 +96,7 @@ class FakePolicy:
         if not self.fresh or not self.held:
             return False
         self.rearming = True
+        self.rearm_attempts += 1
         return True
 
     def set_live_reference_rearm_progress(self, alpha):
@@ -179,7 +188,17 @@ class CaptureLogger:
         self.messages.append(("error", message))
 
 
-def make_state(*, entry_value=0.0, arm_blend_seconds=2.0):
+_UNSET = object()
+
+
+def make_state(
+    *,
+    entry_value=0.0,
+    arm_blend_seconds=2.0,
+    auto_rearm_on_recovery=_UNSET,
+    auto_rearm_blend_seconds=_UNSET,
+    recovery_real_frames=_UNSET,
+):
     policy = FakePolicy()
     normal_policy = FakeNormalPolicy()
     entry = MotorFrame.create(
@@ -191,6 +210,14 @@ def make_state(*, entry_value=0.0, arm_blend_seconds=2.0):
         torque=np.full(ELF3_POLICY_JOINTS.dof_num, 0.8, dtype=np.float32),
     )
     ctx = FakeContext(entry)
+    recovery_kwargs = {}
+    for name, value in (
+        ("auto_rearm_on_recovery", auto_rearm_on_recovery),
+        ("auto_rearm_blend_seconds", auto_rearm_blend_seconds),
+        ("recovery_real_frames", recovery_real_frames),
+    ):
+        if value is not _UNSET:
+            recovery_kwargs[name] = value
     state = ZeroLabArmedTeleopState(
         "zerolab",
         1,
@@ -200,15 +227,22 @@ def make_state(*, entry_value=0.0, arm_blend_seconds=2.0):
         hardware_gripper=False,
         live_reference_timeout_s=0.5,
         arm_blend_seconds=arm_blend_seconds,
+        **recovery_kwargs,
     )
     state._bind_logger(CaptureLogger())
     return state, policy, normal_policy, ctx
 
 
-def prepared_state(*, entry_value=0.0, arm_blend_seconds=2.0):
+def prepared_state(
+    *,
+    entry_value=0.0,
+    arm_blend_seconds=2.0,
+    **recovery_kwargs,
+):
     state, sonic, normal, ctx = make_state(
         entry_value=entry_value,
         arm_blend_seconds=arm_blend_seconds,
+        **recovery_kwargs,
     )
     state.on_prepare(ctx, object())
     return state, sonic, normal, ctx
@@ -226,8 +260,11 @@ def armed_state_at_half_blend():
     return state, sonic, normal, ctx
 
 
-def fully_armed_state():
-    state, sonic, normal, ctx = prepared_state(entry_value=0.0)
+def fully_armed_state(**recovery_kwargs):
+    state, sonic, normal, ctx = prepared_state(
+        entry_value=0.0,
+        **recovery_kwargs,
+    )
     sonic.fresh = True
     state.sample_running_frame(ctx, 0.02, advance=True)
     assert state.on_action(ctx, "arm_zerolab") is True
@@ -237,8 +274,8 @@ def fully_armed_state():
     return state, sonic, normal, ctx
 
 
-def reference_hold_state():
-    state, sonic, normal, ctx = fully_armed_state()
+def reference_hold_state(**recovery_kwargs):
+    state, sonic, normal, ctx = fully_armed_state(**recovery_kwargs)
     sonic.fresh = False
     state.sample_running_frame(ctx, 0.02, advance=True)
     assert state.arm_phase is ZeroLabArmPhase.HOLD_REFERENCE
@@ -253,12 +290,17 @@ def waiting_arm_state():
     return state, sonic, normal, ctx
 
 
-def rearming_state():
+def auto_rearming_state():
     state, sonic, normal, ctx = reference_hold_state()
     sonic.fresh = True
-    assert state.on_action(ctx, "arm_zerolab") is True
+    sonic.recovery_ready = True
+    state.sample_running_frame(ctx, 0.02, advance=True)
     assert state.arm_phase is ZeroLabArmPhase.REARMING
     return state, sonic, normal, ctx
+
+
+def rearming_state():
+    return auto_rearming_state()
 
 
 def state_in_phase(phase_name):
@@ -307,6 +349,27 @@ def test_arm_blend_seconds_must_be_finite_and_positive():
             make_state(arm_blend_seconds=value)
 
 
+@pytest.mark.parametrize("value", [0, 1, 0.0, 1.0])
+def test_auto_rearm_on_recovery_rejects_numeric_booleans(value):
+    with pytest.raises(ValueError, match="auto_rearm_on_recovery"):
+        make_state(auto_rearm_on_recovery=value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [False, True, 0.0, -1.0, float("inf"), float("nan")],
+)
+def test_auto_rearm_blend_seconds_must_be_finite_and_positive(value):
+    with pytest.raises(ValueError, match="auto_rearm_blend_seconds"):
+        make_state(auto_rearm_blend_seconds=value)
+
+
+@pytest.mark.parametrize("value", [False, True, 0, -1, 1.0, 1.5, "10", None])
+def test_recovery_real_frames_must_be_a_positive_integer(value):
+    with pytest.raises(ValueError, match="recovery_real_frames"):
+        make_state(recovery_real_frames=value)
+
+
 def test_waiting_applies_changing_live_normal_with_zero_command():
     state, sonic, normal, ctx = prepared_state(entry_value=0.25)
     normal.target.position.fill(0.4)
@@ -344,6 +407,17 @@ def test_fresh_reference_waits_for_explicit_arm():
 
     assert state.arm_phase is ZeroLabArmPhase.WAIT_ARM
     np.testing.assert_allclose(frame.qpos, 0.0)
+
+
+def test_initial_stream_never_auto_arms_without_btn10_12():
+    state, sonic, _normal, ctx = prepared_state()
+    sonic.fresh = True
+    sonic.recovery_ready = True
+
+    for _ in range(200):
+        state.sample_running_frame(ctx, 0.02, advance=True)
+
+    assert state.arm_phase is ZeroLabArmPhase.WAIT_ARM
 
 
 def test_arm_is_rejected_until_fresh_reference_exists():
@@ -430,17 +504,54 @@ def test_armed_stale_holds_reference_but_keeps_sonic_closed_loop():
     assert sonic.held is True
 
 
-def test_recovered_reference_stays_gated_until_explicit_rearm():
-    state, sonic, normal, ctx = reference_hold_state()
+def test_previously_armed_hold_auto_rearms_after_ten_real_frames():
+    state, sonic, _normal, ctx = reference_hold_state()
     sonic.fresh = True
+    sonic.recovery_ready = False
     state.sample_running_frame(ctx, 0.02, advance=True)
     assert state.arm_phase is ZeroLabArmPhase.HOLD_REFERENCE
     assert sonic.rearming is False
 
-    state.on_action(ctx, "arm_zerolab")
-    state.sample_running_frame(ctx, 1.0, advance=True)
+    sonic.recovery_ready = True
+    state.sample_running_frame(ctx, 0.02, advance=True)
     assert state.arm_phase is ZeroLabArmPhase.REARMING
-    assert sonic.rearm_progress == pytest.approx(0.5)
+    assert sonic.rearming is True
+    assert sonic.rearm_attempts == 1
+
+
+def test_auto_rearm_count_increments_only_after_gate_rearm_succeeds():
+    state, sonic, _normal, ctx = reference_hold_state()
+    sonic.fresh = True
+    sonic.recovery_ready = True
+    sonic.held = False
+
+    state.sample_running_frame(ctx, 0.02, advance=True)
+
+    assert state.arm_phase is ZeroLabArmPhase.HOLD_REFERENCE
+    assert state.auto_rearm_count == 0
+    assert sonic.rearm_attempts == 0
+
+    sonic.held = True
+    state.sample_running_frame(ctx, 0.02, advance=True)
+
+    assert state.arm_phase is ZeroLabArmPhase.REARMING
+    assert state.auto_rearm_count == 1
+    assert sonic.rearm_attempts == 1
+
+
+def test_explicit_recovery_remains_available_when_auto_rearm_is_disabled():
+    state, sonic, _normal, ctx = reference_hold_state(
+        auto_rearm_on_recovery=False
+    )
+    sonic.fresh = True
+    sonic.recovery_ready = True
+
+    state.sample_running_frame(ctx, 0.02, advance=True)
+    assert state.arm_phase is ZeroLabArmPhase.HOLD_REFERENCE
+
+    assert state.on_action(ctx, "arm_zerolab") is True
+    assert state.arm_phase is ZeroLabArmPhase.REARMING
+    assert sonic.rearm_attempts == 1
 
 
 def test_wait_arm_stale_returns_to_wait_stream_with_live_normal():
@@ -475,6 +586,16 @@ def test_rearm_completes_after_two_seconds_with_live_sonic_output():
     assert state.arm_phase is ZeroLabArmPhase.ARMED
 
 
+def test_auto_rearm_uses_separate_two_second_duration():
+    state, sonic, _normal, ctx = auto_rearming_state()
+    state.arm_blend_seconds = 9.0
+
+    state.sample_running_frame(ctx, 1.99, advance=True)
+    assert state.arm_phase is ZeroLabArmPhase.REARMING
+    state.sample_running_frame(ctx, 0.01, advance=True)
+    assert state.arm_phase is ZeroLabArmPhase.ARMED
+
+
 def test_stale_during_rearm_returns_to_reference_hold():
     state, sonic, normal, ctx = rearming_state()
     state.sample_running_frame(ctx, 0.5, advance=True)
@@ -488,7 +609,47 @@ def test_stale_during_rearm_returns_to_reference_hold():
     assert sonic.step_calls == calls + 1
     assert sonic.held is True
     assert sonic.rearming is False
+    assert sonic.held_rearm_progress == pytest.approx(0.216)
     assert state.arm_phase is ZeroLabArmPhase.HOLD_REFERENCE
+
+
+def test_stale_during_rearm_holds_then_retries_after_new_ready_generation():
+    state, sonic, _normal, ctx = auto_rearming_state()
+    sonic.fresh = False
+    sonic.recovery_ready = False
+
+    state.sample_running_frame(ctx, 0.1, advance=True)
+
+    assert state.arm_phase is ZeroLabArmPhase.HOLD_REFERENCE
+    assert sonic.held_rearm_progress == pytest.approx(0.00725)
+    sonic.fresh = True
+    sonic.recovery_ready = True
+    state.sample_running_frame(ctx, 0.02, advance=True)
+    assert state.arm_phase is ZeroLabArmPhase.REARMING
+    assert state.auto_rearm_count == 2
+    assert sonic.rearm_attempts == 2
+
+
+def test_btn10_12_does_not_restart_hold_rearming_or_armed_when_auto_enabled():
+    for phase in ("hold_reference", "rearming", "armed"):
+        state, sonic, _normal, ctx = state_in_phase(phase)
+        before_phase = state.arm_phase
+        before_elapsed = state._blend_elapsed_s
+        before_attempts = sonic.rearm_attempts
+        before_messages = len(state.logger.messages)
+
+        assert state.on_action(ctx, "arm_zerolab") is True
+
+        assert state.arm_phase is before_phase
+        assert state._blend_elapsed_s == before_elapsed
+        assert sonic.rearm_attempts == before_attempts
+        assert state.logger.messages[before_messages:] == [
+            (
+                "info",
+                "ZeroLab ARM ignored; automatic recovery owns "
+                "post-ARM transitions",
+            )
+        ]
 
 
 @pytest.mark.parametrize(
@@ -557,7 +718,8 @@ def test_stale_and_recovery_logs_are_emitted_once_per_stale_session():
     for _ in range(100):
         state.sample_running_frame(ctx, 0.02, advance=True)
     sonic.fresh = True
-    for _ in range(100):
+    sonic.recovery_ready = True
+    for _ in range(101):
         state.sample_running_frame(ctx, 0.02, advance=True)
 
     stale_messages = [
@@ -565,10 +727,20 @@ def test_stale_and_recovery_logs_are_emitted_once_per_stale_session():
         if "ZeroLab reference stale; holding human reference while SONIC balance continues"
         in message
     ]
-    recovery_messages = [
+    rearming_messages = [
         message for _, message in logger.messages
-        if "ZeroLab reference recovered; fresh input pending; send btn_10=12 to rearm"
-        in message
+        if message.startswith(
+            "ZeroLab automatic recovery; ARM phase: REARMING"
+        )
+    ]
+    completion_messages = [
+        message for _, message in logger.messages
+        if message == "ZeroLab automatic recovery complete; ARM phase: ARMED"
     ]
     assert len(stale_messages) == 1
-    assert len(recovery_messages) == 1
+    assert rearming_messages == [
+        "ZeroLab automatic recovery; ARM phase: REARMING for 2.000 s"
+    ]
+    assert completion_messages == [
+        "ZeroLab automatic recovery complete; ARM phase: ARMED"
+    ]

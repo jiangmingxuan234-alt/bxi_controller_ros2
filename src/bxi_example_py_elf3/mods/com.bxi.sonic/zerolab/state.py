@@ -40,6 +40,9 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
         *,
         normal_policy: ResourceHandle[HumanoidGaitPolicyLiteIsaaclab],
         arm_blend_seconds=2.0,
+        auto_rearm_on_recovery=True,
+        auto_rearm_blend_seconds=2.0,
+        recovery_real_frames=10,
         **kwargs,
     ):
         super().__init__(
@@ -54,18 +57,46 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
         if not math.isfinite(value) or value <= 0.0:
             raise ValueError("arm_blend_seconds must be finite and positive")
         self.arm_blend_seconds = value
+        if not isinstance(auto_rearm_on_recovery, bool):
+            raise ValueError("auto_rearm_on_recovery must be a boolean")
+        self.auto_rearm_on_recovery = auto_rearm_on_recovery
+        if isinstance(auto_rearm_blend_seconds, bool):
+            raise ValueError(
+                "auto_rearm_blend_seconds must be finite and positive"
+            )
+        value = float(auto_rearm_blend_seconds)
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(
+                "auto_rearm_blend_seconds must be finite and positive"
+            )
+        self.auto_rearm_blend_seconds = value
+        if (
+            isinstance(recovery_real_frames, bool)
+            or not isinstance(recovery_real_frames, int)
+            or recovery_real_frames < 1
+        ):
+            raise ValueError(
+                "recovery_real_frames must be a positive integer"
+            )
+        self.recovery_real_frames = recovery_real_frames
         self._arm_phase = ZeroLabArmPhase.WAIT_STREAM
         self._entry_frame = None
         self._applied_frame = None
         self._live_frame = None
         self._normal_frame = None
         self._blend_elapsed_s = 0.0
+        self._initial_arm_completed = False
+        self._auto_rearm_count = 0
         self._recovery_notice_logged = False
         self._phase_logged = False
 
     @property
     def arm_phase(self) -> ZeroLabArmPhase:
         return self._arm_phase
+
+    @property
+    def auto_rearm_count(self) -> int:
+        return self._auto_rearm_count
 
     @staticmethod
     def _copy_frame(target: MotorFrame, source: MotorFrame) -> MotorFrame:
@@ -106,6 +137,8 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
         self._copy_frame(self._entry_frame, ctx.last_motor_frame)
         self._copy_frame(self._applied_frame, ctx.last_motor_frame)
         self._blend_elapsed_s = 0.0
+        self._initial_arm_completed = False
+        self._auto_rearm_count = 0
         self._recovery_notice_logged = False
         self._set_phase(
             ZeroLabArmPhase.WAIT_STREAM,
@@ -183,7 +216,7 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
         if self._arm_phase is ZeroLabArmPhase.REARMING:
             self._blend_elapsed_s += max(dt, 0.0)
             alpha = self._smoothstep(
-                self._blend_elapsed_s / self.arm_blend_seconds
+                self._blend_elapsed_s / self.auto_rearm_blend_seconds
             )
             self.policy.set_live_reference_rearm_progress(alpha)
 
@@ -242,7 +275,26 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
             return self._copy_frame(self._applied_frame, self._live_frame)
 
         if self._arm_phase is ZeroLabArmPhase.HOLD_REFERENCE:
-            if fresh_reference and not self._recovery_notice_logged:
+            if (
+                self.auto_rearm_on_recovery
+                and self._initial_arm_completed
+                and self.policy.live_reference_recovery_ready(
+                    self.recovery_real_frames
+                )
+                and self.policy.begin_live_reference_rearm()
+            ):
+                self._blend_elapsed_s = 0.0
+                self._auto_rearm_count += 1
+                self._set_phase(
+                    ZeroLabArmPhase.REARMING,
+                    "ZeroLab automatic recovery; ARM phase: REARMING for "
+                    f"{self.auto_rearm_blend_seconds:.3f} s",
+                )
+            elif (
+                not self.auto_rearm_on_recovery
+                and fresh_reference
+                and not self._recovery_notice_logged
+            ):
                 self.logger.info(
                     "ZeroLab reference recovered; fresh input pending; "
                     "send btn_10=12 to rearm"
@@ -265,6 +317,7 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
                 alpha,
             )
             if self._blend_elapsed_s >= self.arm_blend_seconds:
+                self._initial_arm_completed = True
                 self._set_phase(
                     ZeroLabArmPhase.ARMED,
                     "ZeroLab ARM phase: ARMED",
@@ -275,11 +328,17 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
             return self._copy_frame(self._applied_frame, self._live_frame)
 
         if self._arm_phase is ZeroLabArmPhase.REARMING:
-            if self._blend_elapsed_s >= self.arm_blend_seconds:
+            if self._blend_elapsed_s >= self.auto_rearm_blend_seconds:
                 self.policy.complete_live_reference_rearm()
+                message = "ZeroLab recovery complete; ARM phase: ARMED"
+                if self.auto_rearm_on_recovery:
+                    message = (
+                        "ZeroLab automatic recovery complete; "
+                        "ARM phase: ARMED"
+                    )
                 self._set_phase(
                     ZeroLabArmPhase.ARMED,
-                    "ZeroLab recovery complete; ARM phase: ARMED",
+                    message,
                 )
             return self._copy_frame(self._applied_frame, self._live_frame)
 
@@ -303,6 +362,8 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
         self._live_frame = None
         self._normal_frame = None
         self._blend_elapsed_s = 0.0
+        self._initial_arm_completed = False
+        self._auto_rearm_count = 0
         self._recovery_notice_logged = False
 
     def on_action(self, ctx: RobotControlContext, action_name: str) -> bool:
@@ -319,6 +380,20 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
                 f"{self.arm_blend_seconds:.3f} s",
             )
         elif (
+            self.auto_rearm_on_recovery
+            and self._initial_arm_completed
+            and self._arm_phase
+            in (
+                ZeroLabArmPhase.HOLD_REFERENCE,
+                ZeroLabArmPhase.REARMING,
+                ZeroLabArmPhase.ARMED,
+            )
+        ):
+            self.logger.info(
+                "ZeroLab ARM ignored; automatic recovery owns "
+                "post-ARM transitions"
+            )
+        elif (
             self._arm_phase is ZeroLabArmPhase.HOLD_REFERENCE
             and fresh_reference
         ):
@@ -332,7 +407,7 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
                     ZeroLabArmPhase.REARMING,
                     "ZeroLab recovery ARM accepted; blending human "
                     "reference for "
-                    f"{self.arm_blend_seconds:.3f} s",
+                    f"{self.auto_rearm_blend_seconds:.3f} s",
                 )
         elif self._arm_phase in (
             ZeroLabArmPhase.BLENDING,

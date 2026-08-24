@@ -181,13 +181,16 @@ nodes:
     params:
       udp_bind_host: 0.0.0.0
       udp_port: 18000
-      allowed_sender: 192.168.1.52
+      allowed_sender: 192.168.89.171
       pose_host: 127.0.0.1
       pose_port: 5558
       pose_topic: pose
       rate_hz: 50.0
       window_frames: 10
       stale_seconds: 0.5
+      jitter_buffer_seconds: 0.08
+      short_recovery_blend_seconds: 0.2
+      recovery_real_frames: 10
       record_path: ""
     manifest:
       label: ZeroLab姿态源
@@ -306,6 +309,9 @@ states:
       operator_prompt: >-
         机器人保持实时Normal直到stream ready；确认操作者处于中立姿势后，由安全员发送btn_10=12
       arm_blend_seconds: 2.0
+      auto_rearm_on_recovery: true
+      auto_rearm_blend_seconds: 2.0
+      recovery_real_frames: 10
       require_live_reference: false
       yaw_bias_rad: 1.57079632679
       live_reference_timeout_s: 0.5
