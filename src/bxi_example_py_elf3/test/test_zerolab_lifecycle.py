@@ -1,3 +1,4 @@
+from collections import deque
 from copy import deepcopy
 from pathlib import Path
 import socket
@@ -25,7 +26,7 @@ from zerolab.source_node import (
     ZeroLabSourceNode,
     validate_source_params,
 )
-from zerolab.udp_receiver import ReceivedDatagram
+from zerolab.udp_receiver import DrainBatch, ReceivedDatagram, ZeroLabUdpReceiver
 
 
 MOD_ROOT = Path(__file__).resolve().parents[1] / "mods" / "com.bxi.sonic"
@@ -214,30 +215,33 @@ class ControlledReceiver:
 
     def drain(self):
         self.drain_calls += 1
+        exhausted = len(self.pending) < self.drain_limit
         pending = self.pending[: self.drain_limit]
         del self.pending[: self.drain_limit]
-        return pending
+        return DrainBatch(tuple(pending), exhausted)
 
 
-class ReplenishingReceiver:
-    def __init__(self, payload, *, maximum_safe_calls=16):
-        self.payload = payload
-        self.maximum_safe_calls = maximum_safe_calls
-        self.drain_calls = 0
+class QueuedUdpSocket:
+    def __init__(self, datagrams):
+        self.datagrams = deque(datagrams)
+        self.bound = None
 
-    def drain(self):
-        self.drain_calls += 1
-        if self.drain_calls > self.maximum_safe_calls:
-            raise AssertionError("timer callback did not bound receiver draining")
-        frame_index = 9 + self.drain_calls
-        return [
-            ReceivedDatagram(
-                payload=self.payload,
-                receive_timestamp_ns=frame_index * 20_000_000,
-                local_frame_index=frame_index,
-                sender_address=("127.0.0.1", 50000),
-            )
-        ]
+    def setblocking(self, _value):
+        pass
+
+    def bind(self, address):
+        self.bound = address
+
+    def getsockname(self):
+        return self.bound
+
+    def recvfrom(self, _size):
+        if not self.datagrams:
+            raise BlockingIOError
+        return self.datagrams.popleft()
+
+    def close(self):
+        pass
 
 
 class CapturingPublisher:
@@ -367,23 +371,44 @@ def test_node_drains_more_than_receiver_batch_limit_before_one_sample(
 
     node._tick()
 
-    assert receiver.drain_calls == initial_drain_calls + 3
+    assert receiver.drain_calls == initial_drain_calls + 2
     assert receiver.pending == []
     assert node._core.stats.real_valid_packets == 310
     assert len(publisher.messages) == initial_publications + 1
 
 
-def test_node_bounds_drain_batches_under_continuous_ingress(monkeypatch):
+def test_node_continues_after_full_rejected_batch_until_socket_exhausted(
+    monkeypatch,
+):
     node, _receiver, publisher, clock = ready_controlled_node(monkeypatch)
-    receiver = ReplenishingReceiver(identity_payload())
+    valid_payload = identity_payload()
+    wrong_sender = (valid_payload, ("127.0.0.2", 50000))
+    wrong_size = (bytes(991), ("127.0.0.1", 50000))
+    valid = (valid_payload, ("127.0.0.1", 50000))
+    fake_socket = QueuedUdpSocket(
+        [wrong_sender] * 128 + [wrong_size] * 128 + [valid] * 30
+    )
+    receive_timestamps = iter(
+        [0] * 256 + [index * 20_000_000 for index in range(10, 40)]
+    )
+    receiver = ZeroLabUdpReceiver(
+        allowed_sender_host="127.0.0.1",
+        clock_ns=lambda: next(receive_timestamps),
+        sock=fake_socket,
+    )
+    receiver._next_frame_index = 10
     node._receiver = receiver
     initial_publications = len(publisher.messages)
-    clock[0] = 600_000_000
+    clock[0] = 860_000_000
 
     node._tick()
 
-    assert receiver.drain_calls == receiver.maximum_safe_calls
-    assert node._core.stats.real_valid_packets == 26
+    assert fake_socket.datagrams == deque()
+    assert receiver.stats.received == 286
+    assert receiver.stats.unexpected_sender == 128
+    assert receiver.stats.invalid_size == 128
+    assert receiver.stats.accepted == 30
+    assert node._core.stats.real_valid_packets == 40
     assert len(publisher.messages) == initial_publications + 1
 
 

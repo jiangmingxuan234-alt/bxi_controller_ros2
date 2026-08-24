@@ -19,6 +19,12 @@ class ReceivedDatagram:
 
 
 @dataclass(frozen=True)
+class DrainBatch:
+    datagrams: tuple[ReceivedDatagram, ...]
+    exhausted: bool
+
+
+@dataclass(frozen=True)
 class ReceiverStats:
     received: int = 0
     accepted: int = 0
@@ -101,17 +107,19 @@ class ZeroLabUdpReceiver:
             if result is not _REJECTED:
                 return result
 
-    def drain(self, limit: int = 256) -> list[ReceivedDatagram]:
+    def drain(self, limit: int = 256) -> DrainBatch:
         if limit < 1:
             raise ValueError("limit must be at least 1")
         datagrams = []
+        exhausted = False
         for _ in range(limit):
             result = self._poll_once()
             if result is _SOCKET_EMPTY:
+                exhausted = True
                 break
             if result is not _REJECTED:
                 datagrams.append(result)
-        return datagrams
+        return DrainBatch(tuple(datagrams), exhausted)
 
     def close(self) -> None:
         if self._closed:

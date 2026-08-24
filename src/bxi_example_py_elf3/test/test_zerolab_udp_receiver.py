@@ -68,7 +68,8 @@ def test_receiver_filters_sender_and_size_before_assigning_frames():
         sock=fake,
     )
 
-    datagrams = receiver.drain()
+    batch = receiver.drain()
+    datagrams = batch.datagrams
 
     assert fake.blocking is False
     assert fake.bound == ("0.0.0.0", 18000)
@@ -78,6 +79,7 @@ def test_receiver_filters_sender_and_size_before_assigning_frames():
         "recvfrom",
     ]
     assert len(datagrams) == 1
+    assert batch.exhausted is True
     assert datagrams[0].payload == bytes([7]) * 992
     assert datagrams[0].receive_timestamp_ns == 123456
     assert datagrams[0].local_frame_index == 0
@@ -107,9 +109,12 @@ def test_drain_obeys_limit_and_rejects_invalid_limit():
     ])
     receiver = ZeroLabUdpReceiver(sock=fake)
 
-    datagrams = receiver.drain(limit=1)
+    batch = receiver.drain(limit=1)
 
-    assert [datagram.local_frame_index for datagram in datagrams] == [0]
+    assert [
+        datagram.local_frame_index for datagram in batch.datagrams
+    ] == [0]
+    assert batch.exhausted is False
     assert receiver.poll().local_frame_index == 1
     with pytest.raises(ValueError, match="limit"):
         receiver.drain(limit=0)
@@ -119,7 +124,9 @@ def test_drain_limit_bounds_total_received_datagrams_including_rejected():
     fake = ReplenishingWrongSizeSocket(maximum_safe_receives=256)
     receiver = ZeroLabUdpReceiver(sock=fake)
 
-    assert receiver.drain() == []
+    batch = receiver.drain()
+    assert batch.datagrams == ()
+    assert batch.exhausted is False
     assert len(fake.receive_sizes) == 256
     assert receiver.stats.received == 256
     assert receiver.stats.invalid_size == 256

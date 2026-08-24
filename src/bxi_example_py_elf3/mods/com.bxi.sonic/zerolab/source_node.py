@@ -62,9 +62,6 @@ SOURCE_METADATA_DTYPES = {
 }
 
 
-_MAX_RECEIVER_DRAIN_BATCHES_PER_TICK = 16
-
-
 def validate_source_params(
     raw: Mapping[str, object], *, mod_root: Path | None = None
 ) -> dict[str, object]:
@@ -681,11 +678,9 @@ class ZeroLabSourceNode(Node):
         if self._closed:
             return
         received_valid = False
-        for _ in range(_MAX_RECEIVER_DRAIN_BATCHES_PER_TICK):
-            datagrams = self._receiver.drain()
-            if not datagrams:
-                break
-            for datagram in datagrams:
+        while True:
+            batch = self._receiver.drain()
+            for datagram in batch.datagrams:
                 try:
                     packet = parse_zerolab_packet(
                         datagram.payload,
@@ -702,6 +697,8 @@ class ZeroLabSourceNode(Node):
                 received_valid = True
                 self._record_valid_packet_if_enabled(packet)
                 self._core.accept(packet)
+            if batch.exhausted:
+                break
 
         now_ns = time.monotonic_ns()
         self._core.check_stale(now_ns)
