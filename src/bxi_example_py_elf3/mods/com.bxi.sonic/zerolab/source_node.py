@@ -2,6 +2,7 @@
 
 from collections import deque
 from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import math
 import operator
@@ -17,6 +18,7 @@ from bxi_example_py_elf3.framework.mod_api import NodeBuildContext
 
 from .converter import ConvertedPoseFrame, ZeroLabMotionConverter
 from .protocol import ZeroLabProtocolError, parse_zerolab_packet
+from .resampler import ZeroLabPoseResampler
 from .recording import (
     RawRecord,
     RawRecordingWriter,
@@ -25,8 +27,10 @@ from .recording import (
 from .udp_receiver import ZeroLabUdpReceiver
 
 if __package__ == "zerolab":
+    from pico.streamed_smpl_ref import new_stream_epoch
     from pico.zmq_messages import pack_pose_message
 else:
+    from ..pico.streamed_smpl_ref import new_stream_epoch
     from ..pico.zmq_messages import pack_pose_message
 
 
@@ -40,7 +44,21 @@ SOURCE_DEFAULTS: dict[str, object] = {
     "rate_hz": 50.0,
     "window_frames": 10,
     "stale_seconds": 0.5,
+    "jitter_buffer_seconds": 0.08,
+    "short_recovery_blend_seconds": 0.2,
+    "recovery_real_frames": 10,
     "record_path": "",
+}
+
+
+SOURCE_METADATA_DTYPES = {
+    "source_generation": np.int64,
+    "latest_real_frame_index": np.int64,
+    "latest_real_receive_timestamp_ns": np.int64,
+    "real_valid_frames_in_generation": np.int32,
+    "real_stream_ready": np.uint8,
+    "playout_kind": np.uint8,
+    "source_stale": np.uint8,
 }
 
 
@@ -97,6 +115,23 @@ def validate_source_params(
         or stale_seconds <= 0
     ):
         raise ValueError("stale_seconds must be greater than zero")
+
+    for name in ("jitter_buffer_seconds", "short_recovery_blend_seconds"):
+        value = params[name]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise ValueError(f"{name} must be greater than zero")
+    recovery_real_frames = params["recovery_real_frames"]
+    if (
+        isinstance(recovery_real_frames, bool)
+        or not isinstance(recovery_real_frames, int)
+        or recovery_real_frames < 1
+    ):
+        raise ValueError("recovery_real_frames must be a positive integer")
 
     record_path = params["record_path"]
     if record_path and mod_root is not None:
@@ -197,29 +232,99 @@ class PoseChunkWindow:
         }
 
 
+@dataclass(frozen=True)
+class ZeroLabSourceStats:
+    real_valid_packets: int = 0
+    maximum_real_arrival_gap_ms: float = 0.0
+    stale_events: int = 0
+
+
 class ZeroLabSourceCore:
     """Apply stale-stream semantics around ZeroLab conversion and chunking."""
 
     def __init__(
         self,
         converter: ZeroLabMotionConverter,
+        *,
+        resampler: ZeroLabPoseResampler | None = None,
         window_frames: int = 10,
         stale_seconds: float = 0.5,
+        recovery_real_frames: int = 10,
+        generation_factory=new_stream_epoch,
     ) -> None:
         if not np.isfinite(stale_seconds) or stale_seconds < 0.0:
             raise ValueError("stale_seconds must be finite and non-negative")
+        if (
+            isinstance(recovery_real_frames, bool)
+            or not isinstance(recovery_real_frames, int)
+            or recovery_real_frames < 1
+        ):
+            raise ValueError("recovery_real_frames must be a positive integer")
         self._converter = converter
+        self._resampler = resampler or ZeroLabPoseResampler(
+            jitter_buffer_seconds=0.08,
+            short_recovery_blend_seconds=0.2,
+            output_rate_hz=50.0,
+        )
         self._window = PoseChunkWindow(window_frames)
         self._stale_ns = int(float(stale_seconds) * 1_000_000_000)
-        self._last_timestamp_ns = None
-        self._stale_handled = False
+        self._recovery_real_frames = recovery_real_frames
+        self._generation_factory = generation_factory
+        self._source_generation = self._generation_factory(None)
+        if (
+            isinstance(self._source_generation, bool)
+            or not isinstance(self._source_generation, (int, np.integer))
+            or self._source_generation < 1
+        ):
+            raise ValueError("source_generation must be a positive integer")
+        self._source_generation = int(self._source_generation)
+        self._latest_real_frame_index = None
+        self._latest_real_receive_timestamp_ns = None
+        self._real_valid_frames_in_generation = 0
+        self._source_stale = False
         self._stale_event_pending = False
+        self._stats = ZeroLabSourceStats()
+
+    @property
+    def source_generation(self) -> int:
+        return self._source_generation
+
+    @property
+    def latest_real_frame_index(self) -> int | None:
+        return self._latest_real_frame_index
+
+    @property
+    def latest_real_receive_timestamp_ns(self) -> int | None:
+        return self._latest_real_receive_timestamp_ns
+
+    @property
+    def real_valid_frames_in_generation(self) -> int:
+        return self._real_valid_frames_in_generation
+
+    @property
+    def real_stream_ready(self) -> bool:
+        return bool(
+            not self._source_stale
+            and self._real_valid_frames_in_generation
+            >= self._recovery_real_frames
+            and self._window.ready
+        )
+
+    @property
+    def stats(self) -> ZeroLabSourceStats:
+        return self._stats
 
     def _mark_stale(self) -> None:
         self._window.clear()
         self._converter.mark_stale()
-        self._stale_handled = True
+        self._resampler.mark_stale()
+        self._source_generation = self._generation_factory(self._source_generation)
+        self._real_valid_frames_in_generation = 0
+        self._source_stale = True
         self._stale_event_pending = True
+        self._stats = replace(
+            self._stats, stale_events=self._stats.stale_events + 1
+        )
 
     def consume_stale_event(self) -> bool:
         """Return and clear a pending stale transition."""
@@ -227,26 +332,95 @@ class ZeroLabSourceCore:
         self._stale_event_pending = False
         return pending
 
-    def accept(self, packet):
+    def accept(self, packet) -> bool:
         timestamp_ns = operator.index(packet.receive_timestamp_ns)
         if (
-            self._last_timestamp_ns is not None
-            and not self._stale_handled
-            and timestamp_ns - self._last_timestamp_ns > self._stale_ns
+            self._latest_real_receive_timestamp_ns is not None
+            and not self._source_stale
+            and timestamp_ns - self._latest_real_receive_timestamp_ns
+            > self._stale_ns
         ):
             self._mark_stale()
 
         frame = self._converter.observe(packet)
-        self._last_timestamp_ns = timestamp_ns
-        self._stale_handled = False
-        return self._window.append(frame)
+        if not self._resampler.observe(frame):
+            return False
+
+        maximum_gap_ms = self._stats.maximum_real_arrival_gap_ms
+        if self._latest_real_receive_timestamp_ns is not None:
+            arrival_gap_ms = (
+                timestamp_ns - self._latest_real_receive_timestamp_ns
+            ) / 1_000_000.0
+            maximum_gap_ms = max(maximum_gap_ms, arrival_gap_ms)
+        self._latest_real_frame_index = int(frame.frame_index)
+        self._latest_real_receive_timestamp_ns = timestamp_ns
+        self._real_valid_frames_in_generation = min(
+            self._recovery_real_frames,
+            self._real_valid_frames_in_generation + 1,
+        )
+        self._source_stale = False
+        self._stats = replace(
+            self._stats,
+            real_valid_packets=self._stats.real_valid_packets + 1,
+            maximum_real_arrival_gap_ms=maximum_gap_ms,
+        )
+        return True
+
+    def sample(self, now_ns: int) -> dict[str, np.ndarray] | None:
+        now_timestamp_ns = operator.index(now_ns)
+        resampled = self._resampler.sample(now_timestamp_ns)
+        if resampled is None:
+            return None
+        fields = self._window.append(resampled.frame)
+        if fields is None:
+            return None
+
+        source_stale = self._source_stale
+        if self._latest_real_receive_timestamp_ns is not None:
+            source_stale = source_stale or (
+                now_timestamp_ns - self._latest_real_receive_timestamp_ns
+                > self._stale_ns
+            )
+        real_stream_ready = bool(
+            not source_stale
+            and self._real_valid_frames_in_generation
+            >= self._recovery_real_frames
+            and self._window.ready
+        )
+        fields.update(
+            {
+                "source_generation": np.asarray(
+                    [self._source_generation], dtype=np.int64
+                ),
+                "latest_real_frame_index": np.asarray(
+                    [self._latest_real_frame_index], dtype=np.int64
+                ),
+                "latest_real_receive_timestamp_ns": np.asarray(
+                    [self._latest_real_receive_timestamp_ns], dtype=np.int64
+                ),
+                "real_valid_frames_in_generation": np.asarray(
+                    [self._real_valid_frames_in_generation], dtype=np.int32
+                ),
+                "real_stream_ready": np.asarray(
+                    [real_stream_ready], dtype=np.uint8
+                ),
+                "playout_kind": np.asarray(
+                    [resampled.kind], dtype=np.uint8
+                ),
+                "source_stale": np.asarray(
+                    [source_stale], dtype=np.uint8
+                ),
+            }
+        )
+        return fields
 
     def check_stale(self, now_ns: int) -> bool:
         now_timestamp_ns = operator.index(now_ns)
         if (
-            self._last_timestamp_ns is None
-            or self._stale_handled
-            or now_timestamp_ns - self._last_timestamp_ns <= self._stale_ns
+            self._latest_real_receive_timestamp_ns is None
+            or self._source_stale
+            or now_timestamp_ns - self._latest_real_receive_timestamp_ns
+            <= self._stale_ns
         ):
             return False
         self._mark_stale()
@@ -327,8 +501,18 @@ class ZeroLabSourceNode(Node):
             self._converter = ZeroLabMotionConverter()
             self._core = ZeroLabSourceCore(
                 self._converter,
+                resampler=ZeroLabPoseResampler(
+                    jitter_buffer_seconds=float(
+                        params["jitter_buffer_seconds"]
+                    ),
+                    short_recovery_blend_seconds=float(
+                        params["short_recovery_blend_seconds"]
+                    ),
+                    output_rate_hz=float(params["rate_hz"]),
+                ),
                 window_frames=int(params["window_frames"]),
                 stale_seconds=float(params["stale_seconds"]),
+                recovery_real_frames=int(params["recovery_real_frames"]),
             )
             self._publisher = ZeroLabPosePublisher(
                 str(params["pose_host"]),
@@ -521,8 +705,10 @@ def create_node(context: NodeBuildContext) -> ZeroLabSourceNode:
 __all__ = [
     "PoseChunkWindow",
     "SOURCE_DEFAULTS",
+    "SOURCE_METADATA_DTYPES",
     "ZeroLabPosePublisher",
     "ZeroLabSourceCore",
+    "ZeroLabSourceStats",
     "ZeroLabSourceNode",
     "create_node",
     "validate_source_params",

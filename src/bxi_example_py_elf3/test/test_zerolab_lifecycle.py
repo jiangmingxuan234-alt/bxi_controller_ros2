@@ -65,6 +65,9 @@ def source_context(udp_port, pose_port, node_name):
             "rate_hz": 50.0,
             "window_frames": 10,
             "stale_seconds": 0.5,
+            "jitter_buffer_seconds": 0.08,
+            "short_recovery_blend_seconds": 0.2,
+            "recovery_real_frames": 10,
             "record_path": "",
         },
     )
@@ -94,6 +97,35 @@ def source_context(udp_port, pose_port, node_name):
 def test_source_rejects_unknown_or_unsafe_params(params, message):
     with pytest.raises(ValueError, match=message):
         validate_source_params(params)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("jitter_buffer_seconds", 0.0),
+        ("jitter_buffer_seconds", float("nan")),
+        ("short_recovery_blend_seconds", -0.1),
+        ("short_recovery_blend_seconds", True),
+        ("recovery_real_frames", 0),
+        ("recovery_real_frames", True),
+    ],
+)
+def test_source_rejects_invalid_resampling_params(name, value):
+    with pytest.raises(ValueError, match=name):
+        validate_source_params({name: value})
+
+
+def test_source_accepts_valid_resampling_params():
+    params = validate_source_params(
+        {
+            "jitter_buffer_seconds": 0.08,
+            "short_recovery_blend_seconds": 0.2,
+            "recovery_real_frames": 10,
+        }
+    )
+    assert params["jitter_buffer_seconds"] == 0.08
+    assert params["short_recovery_blend_seconds"] == 0.2
+    assert params["recovery_real_frames"] == 10
 
 
 def test_source_rejects_recording_path_inside_mod_root():
@@ -221,6 +253,40 @@ def identity_payload():
             positions.tobytes(),
         )
     )
+
+
+class RejectMalformedCore:
+    def accept(self, _packet):
+        raise AssertionError("malformed packet reached core.accept")
+
+    def check_stale(self, _now_ns):
+        return False
+
+    def consume_stale_event(self):
+        return False
+
+
+def test_malformed_packet_never_reaches_core_accept(monkeypatch):
+    monkeypatch.setattr("zerolab.source_node.time.monotonic_ns", lambda: 0)
+    receiver = ControlledReceiver(b"malformed")
+    receiver.queue(0, 0)
+    logger = CapturingLogger()
+    node = ZeroLabSourceNode.__new__(ZeroLabSourceNode)
+    node._closed = False
+    node._receiver = receiver
+    node._core = RejectMalformedCore()
+    node._publisher = CapturingPublisher()
+    node._writer = None
+    node._recording_enabled = False
+    node._invalid_packets = 0
+    node._dropped_publications = 0
+    node._stream_state = None
+    node.get_logger = lambda: logger
+
+    node._tick()
+
+    assert node._invalid_packets == 1
+    assert len(logger.warnings) == 1
 
 
 def test_executor_gap_logs_stale_once_then_ready_once_after_refill(
