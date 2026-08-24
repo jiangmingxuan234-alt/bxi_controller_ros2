@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -12,6 +12,10 @@ from bxi_example_py_elf3.framework.inference import PolicyOutput
 from bxi_example_py_elf3.framework.joints import JointTargetBuffer
 from bxi_example_py_elf3.framework.mod_api.transition import MotorFrame
 from bxi_example_py_elf3.policies.joints import ELF3_POLICY_JOINTS
+from zerolab.converter import ZeroLabMotionConverter
+from zerolab.protocol import ZeroLabPacket
+from zerolab.resampler import PlayoutKind, ZeroLabPoseResampler
+from zerolab.source_node import ZeroLabSourceCore
 
 
 MOD_ROOT = Path(__file__).resolve().parents[1] / "mods" / "com.bxi.sonic"
@@ -38,8 +42,14 @@ def _load_module(name: str, relative_path: str):
     return module
 
 
+policy_module = _load_module("policy", "policy.py")
 base_state_module = _load_module("state", "state.py")
 arming_module = _load_module("zerolab.state", "zerolab/state.py")
+reference_gate_module = sys.modules[f"{PACKAGE}.reference_gate"]
+SonicTeleopPolicy = policy_module.SonicTeleopPolicy
+LiveReferenceGate = reference_gate_module.LiveReferenceGate
+ReferenceGateMode = reference_gate_module.ReferenceGateMode
+SmplReferenceFrame = reference_gate_module.SmplReferenceFrame
 ZeroLabArmPhase = arming_module.ZeroLabArmPhase
 ZeroLabArmedTeleopState = arming_module.ZeroLabArmedTeleopState
 
@@ -108,6 +118,66 @@ class FakePolicy:
 
     def reset_yaw_alignment(self):
         pass
+
+
+class SourceBackedPolicy(FakePolicy):
+    def __init__(self):
+        super().__init__()
+        self._live_reference_gate = LiveReferenceGate()
+        self.live_ref_timeout_s = 0.5
+        self.source_now_ns = None
+
+    def observe_source(self, fields, *, now_ns):
+        assert fields is not None
+        self.source_now_ns = int(now_ns)
+        root_quat = np.zeros((10, 4), dtype=np.float32)
+        root_quat[:, 0] = 1.0
+        self._live_reference_gate.observe(
+            SmplReferenceFrame(
+                term1_local=np.zeros((10, 72), dtype=np.float32),
+                root_quat=root_quat,
+                wrist=np.zeros((10, 6), dtype=np.float32),
+                head_joint_pos=np.zeros((10, 2), dtype=np.float32),
+                frame_index=int(fields["frame_index"][-1]),
+                newest_frame_index=int(fields["frame_index"][-1]),
+                valid_horizon=10,
+                clamp_slots=0,
+                source_generation=int(fields["source_generation"][0]),
+                latest_real_frame_index=int(
+                    fields["latest_real_frame_index"][0]
+                ),
+                latest_real_receive_timestamp_ns=int(
+                    fields["latest_real_receive_timestamp_ns"][0]
+                ),
+                real_valid_frames_in_generation=int(
+                    fields["real_valid_frames_in_generation"][0]
+                ),
+                real_stream_ready=bool(fields["real_stream_ready"][0]),
+                playout_kind=int(fields["playout_kind"][0]),
+                source_stale=bool(fields["source_stale"][0]),
+            ),
+            received_mono=self.source_now_ns / 1.0e9,
+        )
+
+    @property
+    def reference_mode(self):
+        return self._live_reference_gate.mode
+
+    def poll_reference(self):
+        return self._live_reference_gate.observed_reference
+
+    has_fresh_live_reference = SonicTeleopPolicy.has_fresh_live_reference
+    live_reference_recovery_ready = (
+        SonicTeleopPolicy.live_reference_recovery_ready
+    )
+    hold_live_reference = SonicTeleopPolicy.hold_live_reference
+    begin_live_reference_rearm = SonicTeleopPolicy.begin_live_reference_rearm
+    set_live_reference_rearm_progress = (
+        SonicTeleopPolicy.set_live_reference_rearm_progress
+    )
+    complete_live_reference_rearm = (
+        SonicTeleopPolicy.complete_live_reference_rearm
+    )
 
 
 class FakeNormalPolicy:
@@ -195,11 +265,12 @@ def make_state(
     *,
     entry_value=0.0,
     arm_blend_seconds=2.0,
+    sonic_policy=None,
     auto_rearm_on_recovery=_UNSET,
     auto_rearm_blend_seconds=_UNSET,
     recovery_real_frames=_UNSET,
 ):
-    policy = FakePolicy()
+    policy = FakePolicy() if sonic_policy is None else sonic_policy
     normal_policy = FakeNormalPolicy()
     entry = MotorFrame.create(
         ELF3_POLICY_JOINTS,
@@ -280,6 +351,79 @@ def reference_hold_state(**recovery_kwargs):
     state.sample_running_frame(ctx, 0.02, advance=True)
     assert state.arm_phase is ZeroLabArmPhase.HOLD_REFERENCE
     return state, sonic, normal, ctx
+
+
+def source_packet(index, *, timestamp_ns):
+    quaternions = np.zeros((47, 4), dtype=np.float32)
+    quaternions[:, 3] = 1.0
+    return ZeroLabPacket(
+        receive_timestamp_ns=timestamp_ns,
+        local_frame_index=index,
+        root_translation=np.zeros(3, dtype=np.float32),
+        joint_quat_world_xyzw=quaternions,
+        left_hand_values=np.zeros(6, dtype=np.uint16),
+        right_hand_values=np.zeros(6, dtype=np.uint16),
+        joint_position=np.zeros((17, 3), dtype=np.float32),
+        raw_payload=bytes(992),
+        sender_address=("127.0.0.1", 50000),
+    )
+
+
+def source_backed_armed_state(monkeypatch):
+    generations = iter((101, 202))
+    core = ZeroLabSourceCore(
+        ZeroLabMotionConverter(),
+        resampler=ZeroLabPoseResampler(
+            jitter_buffer_seconds=0.08,
+            short_recovery_blend_seconds=0.2,
+            output_rate_hz=50.0,
+        ),
+        window_frames=10,
+        stale_seconds=0.5,
+        recovery_real_frames=10,
+        generation_factory=lambda _previous=None: next(generations),
+    )
+    sonic = SourceBackedPolicy()
+    monkeypatch.setattr(
+        policy_module,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: sonic.source_now_ns / 1.0e9,
+            monotonic_ns=lambda: sonic.source_now_ns,
+        ),
+    )
+    state, sonic, normal, ctx = prepared_state(sonic_policy=sonic)
+    fields = None
+    sample_now_ns = None
+    for index in range(10):
+        timestamp_ns = index * 20_000_000
+        assert core.accept(source_packet(index, timestamp_ns=timestamp_ns))
+        sample_now_ns = 80_000_000 + timestamp_ns
+        fields = core.sample(sample_now_ns)
+    assert fields is not None
+    sonic.observe_source(fields, now_ns=sample_now_ns)
+    state.sample_running_frame(ctx, 0.02, advance=True)
+    assert state.arm_phase is ZeroLabArmPhase.WAIT_ARM
+    assert state.on_action(ctx, "arm_zerolab") is True
+    state.sample_running_frame(ctx, 2.0, advance=True)
+    assert state.arm_phase is ZeroLabArmPhase.ARMED
+    return state, sonic, normal, ctx, core
+
+
+def accept_source_packet(
+    core,
+    sonic,
+    index,
+    timestamp_ns,
+    *,
+    sample_now_ns=None,
+):
+    assert core.accept(source_packet(index, timestamp_ns=timestamp_ns))
+    now_ns = timestamp_ns if sample_now_ns is None else sample_now_ns
+    fields = core.sample(now_ns)
+    assert fields is not None
+    sonic.observe_source(fields, now_ns=now_ns)
+    return fields
 
 
 def waiting_arm_state():
@@ -519,22 +663,115 @@ def test_previously_armed_hold_auto_rearms_after_ten_real_frames():
     assert sonic.rearm_attempts == 1
 
 
-@pytest.mark.parametrize("real_frames", range(10))
-def test_hold_does_not_auto_rearm_before_ten_real_frames(real_frames):
-    state, sonic, _normal, ctx = reference_hold_state()
-    sonic.fresh = True
-    sonic.recovery_ready = real_frames >= 10
+@pytest.mark.parametrize("gap_s", [0.10, 0.49])
+def test_short_gap_remains_armed_and_uses_short_recovery(gap_s, monkeypatch):
+    state, sonic, _normal, ctx, core = source_backed_armed_state(monkeypatch)
+    last_real_ns = core.latest_real_receive_timestamp_ns
+    gap_now_ns = last_real_ns + int(gap_s * 1.0e9)
+
+    assert core.check_stale(gap_now_ns) is False
+    held_fields = core.sample(gap_now_ns)
+    assert held_fields is not None
+    assert int(held_fields["playout_kind"][0]) == int(PlayoutKind.HELD)
+    sonic.observe_source(held_fields, now_ns=gap_now_ns)
     state.sample_running_frame(ctx, 0.02, advance=True)
+
+    assert state.arm_phase is ZeroLabArmPhase.ARMED
+    assert state.auto_rearm_count == 0
+    assert sonic.reference_mode is ReferenceGateMode.LIVE
+
+    recovered_fields = accept_source_packet(
+        core,
+        sonic,
+        10,
+        gap_now_ns,
+        sample_now_ns=gap_now_ns + 20_000_000,
+    )
+    assert int(recovered_fields["playout_kind"][0]) == int(
+        PlayoutKind.SHORT_RECOVERY_BLEND
+    )
+    state.sample_running_frame(ctx, 0.02, advance=True)
+    assert state.arm_phase is ZeroLabArmPhase.ARMED
+    assert state.auto_rearm_count == 0
+    assert sonic.reference_mode is ReferenceGateMode.LIVE
+
+
+@pytest.mark.parametrize("gap_s", [0.51, 2.0, 30.0])
+def test_long_gap_holds_until_tenth_real_packet_then_auto_rearms(
+    gap_s, monkeypatch
+):
+    state, sonic, _normal, ctx, core = source_backed_armed_state(monkeypatch)
+    last_real_ns = core.latest_real_receive_timestamp_ns
+    gap_now_ns = last_real_ns + int(gap_s * 1.0e9)
+
+    assert core.check_stale(gap_now_ns) is True
+    stale_fields = core.sample(gap_now_ns)
+    assert stale_fields is not None
+    sonic.observe_source(stale_fields, now_ns=gap_now_ns)
+    state.sample_running_frame(ctx, 0.02, advance=True)
+
+    assert core.real_valid_frames_in_generation == 0
     assert state.arm_phase is ZeroLabArmPhase.HOLD_REFERENCE
+    assert state.auto_rearm_count == 0
+    assert sonic.reference_mode is ReferenceGateMode.HOLD
 
+    packet_index = 10
+    packet_timestamp_ns = gap_now_ns
+    for real_frames in range(1, 10):
+        packet_timestamp_ns += 20_000_000
+        fields = accept_source_packet(
+            core,
+            sonic,
+            packet_index,
+            packet_timestamp_ns,
+        )
+        packet_index += 1
+        state.sample_running_frame(ctx, 0.02, advance=True)
+        assert int(fields["real_valid_frames_in_generation"][0]) == real_frames
+        assert int(fields["real_stream_ready"][0]) == 0
+        assert state.arm_phase is ZeroLabArmPhase.HOLD_REFERENCE
+        assert state.auto_rearm_count == 0
+        assert sonic.reference_mode is ReferenceGateMode.HOLD
 
-def test_tenth_real_frame_auto_rearms_without_second_arm_action():
-    state, sonic, _normal, ctx = reference_hold_state()
-    sonic.fresh = True
-    sonic.recovery_ready = True
+    packet_timestamp_ns += 20_000_000
+    tenth_fields = accept_source_packet(
+        core,
+        sonic,
+        packet_index,
+        packet_timestamp_ns,
+    )
+    packet_index += 1
     state.sample_running_frame(ctx, 0.02, advance=True)
+
+    assert int(tenth_fields["real_valid_frames_in_generation"][0]) == 10
+    assert int(tenth_fields["real_stream_ready"][0]) == 1
     assert state.arm_phase is ZeroLabArmPhase.REARMING
-    assert sonic.rearm_attempts == 1
+    assert state.auto_rearm_count == 1
+    assert sonic.reference_mode is ReferenceGateMode.REARMING
+
+    for _ in range(99):
+        packet_timestamp_ns += 20_000_000
+        accept_source_packet(
+            core,
+            sonic,
+            packet_index,
+            packet_timestamp_ns,
+        )
+        packet_index += 1
+        state.sample_running_frame(ctx, 0.02, advance=True)
+    assert state.arm_phase is ZeroLabArmPhase.REARMING
+
+    packet_timestamp_ns += 20_000_000
+    accept_source_packet(
+        core,
+        sonic,
+        packet_index,
+        packet_timestamp_ns,
+    )
+    state.sample_running_frame(ctx, 0.02, advance=True)
+    assert state.arm_phase is ZeroLabArmPhase.ARMED
+    assert state.auto_rearm_count == 1
+    assert sonic.reference_mode is ReferenceGateMode.LIVE
 
 
 def test_auto_rearm_count_increments_only_after_gate_rearm_succeeds():
