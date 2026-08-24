@@ -43,6 +43,24 @@ def test_regular_input_plays_at_target_delayed_by_80_ms():
     assert output.latest_real_receive_timestamp_ns == 120_000_000
 
 
+def test_sample_coalesces_calls_inside_configured_output_period():
+    resampler = ZeroLabPoseResampler(
+        jitter_buffer_seconds=0.08,
+        short_recovery_blend_seconds=0.2,
+        output_rate_hz=100.0,
+    )
+    resampler.observe(frame(0, 0, 0.0))
+    resampler.observe(frame(1, 10_000_000, 1.0))
+
+    first = resampler.sample(80_000_000)
+    assert resampler.sample(89_999_999) is None
+    second = resampler.sample(90_000_000)
+
+    assert first.frame.frame_index == 0
+    assert second.frame.frame_index == 1
+    assert second.frame.receive_timestamp_ns == 10_000_000
+
+
 def test_jittered_samples_interpolate_continuous_fields():
     resampler = make_resampler()
     resampler.observe(frame(0, 0, 0.0))
