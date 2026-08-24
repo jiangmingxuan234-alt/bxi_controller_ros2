@@ -6,6 +6,10 @@ from typing import Callable
 from .protocol import PACKET_SIZE
 
 
+_SOCKET_EMPTY = object()
+_REJECTED = object()
+
+
 @dataclass(frozen=True)
 class ReceivedDatagram:
     payload: bytes
@@ -52,53 +56,61 @@ class ZeroLabUdpReceiver:
     def stats(self) -> ReceiverStats:
         return replace(self._stats)
 
+    def _poll_once(self):
+        try:
+            payload, sender_address = self._socket.recvfrom(65535)
+        except BlockingIOError:
+            return _SOCKET_EMPTY
+        receive_timestamp_ns = self._clock_ns()
+        self._stats = replace(
+            self._stats, received=self._stats.received + 1
+        )
+        if (
+            self._allowed_sender_host is not None
+            and sender_address[0] != self._allowed_sender_host
+        ):
+            self._stats = replace(
+                self._stats,
+                unexpected_sender=self._stats.unexpected_sender + 1,
+            )
+            return _REJECTED
+        if len(payload) != PACKET_SIZE:
+            self._stats = replace(
+                self._stats, invalid_size=self._stats.invalid_size + 1
+            )
+            return _REJECTED
+        datagram = ReceivedDatagram(
+            payload=bytes(payload),
+            receive_timestamp_ns=receive_timestamp_ns,
+            local_frame_index=self._next_frame_index,
+            sender_address=(
+                str(sender_address[0]), int(sender_address[1])
+            ),
+        )
+        self._next_frame_index += 1
+        self._stats = replace(
+            self._stats, accepted=self._stats.accepted + 1
+        )
+        return datagram
+
     def poll(self) -> ReceivedDatagram | None:
         while True:
-            try:
-                payload, sender_address = self._socket.recvfrom(65535)
-            except BlockingIOError:
+            result = self._poll_once()
+            if result is _SOCKET_EMPTY:
                 return None
-            receive_timestamp_ns = self._clock_ns()
-            self._stats = replace(
-                self._stats, received=self._stats.received + 1
-            )
-            if (
-                self._allowed_sender_host is not None
-                and sender_address[0] != self._allowed_sender_host
-            ):
-                self._stats = replace(
-                    self._stats,
-                    unexpected_sender=self._stats.unexpected_sender + 1,
-                )
-                continue
-            if len(payload) != PACKET_SIZE:
-                self._stats = replace(
-                    self._stats, invalid_size=self._stats.invalid_size + 1
-                )
-                continue
-            datagram = ReceivedDatagram(
-                payload=bytes(payload),
-                receive_timestamp_ns=receive_timestamp_ns,
-                local_frame_index=self._next_frame_index,
-                sender_address=(
-                    str(sender_address[0]), int(sender_address[1])
-                ),
-            )
-            self._next_frame_index += 1
-            self._stats = replace(
-                self._stats, accepted=self._stats.accepted + 1
-            )
-            return datagram
+            if result is not _REJECTED:
+                return result
 
     def drain(self, limit: int = 256) -> list[ReceivedDatagram]:
         if limit < 1:
             raise ValueError("limit must be at least 1")
         datagrams = []
-        while len(datagrams) < limit:
-            datagram = self.poll()
-            if datagram is None:
+        for _ in range(limit):
+            result = self._poll_once()
+            if result is _SOCKET_EMPTY:
                 break
-            datagrams.append(datagram)
+            if result is not _REJECTED:
+                datagrams.append(result)
         return datagrams
 
     def close(self) -> None:

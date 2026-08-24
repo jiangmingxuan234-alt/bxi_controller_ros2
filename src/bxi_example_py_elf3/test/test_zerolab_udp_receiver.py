@@ -36,6 +36,18 @@ class FakeSocket:
         self.closed = True
 
 
+class ReplenishingWrongSizeSocket(FakeSocket):
+    def __init__(self, maximum_safe_receives):
+        super().__init__([])
+        self.maximum_safe_receives = maximum_safe_receives
+
+    def recvfrom(self, size):
+        self.receive_sizes.append(size)
+        if len(self.receive_sizes) > self.maximum_safe_receives:
+            raise AssertionError("receiver drain did not bound rejected traffic")
+        return bytes(991), ("10.0.0.2", 4000)
+
+
 def test_receiver_filters_sender_and_size_before_assigning_frames():
     events = []
     fake = FakeSocket([
@@ -101,6 +113,17 @@ def test_drain_obeys_limit_and_rejects_invalid_limit():
     assert receiver.poll().local_frame_index == 1
     with pytest.raises(ValueError, match="limit"):
         receiver.drain(limit=0)
+
+
+def test_drain_limit_bounds_total_received_datagrams_including_rejected():
+    fake = ReplenishingWrongSizeSocket(maximum_safe_receives=256)
+    receiver = ZeroLabUdpReceiver(sock=fake)
+
+    assert receiver.drain() == []
+    assert len(fake.receive_sizes) == 256
+    assert receiver.stats.received == 256
+    assert receiver.stats.invalid_size == 256
+    assert receiver.stats.accepted == 0
 
 
 @pytest.mark.parametrize("port", [-1, 65536])

@@ -196,9 +196,11 @@ def test_existing_bridge_releases_its_output_port(rclpy_runtime):
 
 
 class ControlledReceiver:
-    def __init__(self, payload):
+    def __init__(self, payload, *, drain_limit=256):
         self.payload = payload
         self.pending = []
+        self.drain_limit = drain_limit
+        self.drain_calls = 0
 
     def queue(self, frame_index, timestamp_ns):
         self.pending.append(
@@ -211,8 +213,31 @@ class ControlledReceiver:
         )
 
     def drain(self):
-        pending, self.pending = self.pending, []
+        self.drain_calls += 1
+        pending = self.pending[: self.drain_limit]
+        del self.pending[: self.drain_limit]
         return pending
+
+
+class ReplenishingReceiver:
+    def __init__(self, payload, *, maximum_safe_calls=16):
+        self.payload = payload
+        self.maximum_safe_calls = maximum_safe_calls
+        self.drain_calls = 0
+
+    def drain(self):
+        self.drain_calls += 1
+        if self.drain_calls > self.maximum_safe_calls:
+            raise AssertionError("timer callback did not bound receiver draining")
+        frame_index = 9 + self.drain_calls
+        return [
+            ReceivedDatagram(
+                payload=self.payload,
+                receive_timestamp_ns=frame_index * 20_000_000,
+                local_frame_index=frame_index,
+                sender_address=("127.0.0.1", 50000),
+            )
+        ]
 
 
 class CapturingPublisher:
@@ -327,6 +352,38 @@ def test_node_drains_burst_but_publishes_at_most_once_per_tick(monkeypatch):
     node._tick()
     assert receiver.pending == []
     assert node._core.stats.real_valid_packets == 40
+    assert len(publisher.messages) == initial_publications + 1
+
+
+def test_node_drains_more_than_receiver_batch_limit_before_one_sample(
+    monkeypatch,
+):
+    node, receiver, publisher, clock = ready_controlled_node(monkeypatch)
+    initial_drain_calls = receiver.drain_calls
+    initial_publications = len(publisher.messages)
+    for index in range(10, 310):
+        receiver.queue(index, index * 20_000_000)
+    clock[0] = 6_260_000_000
+
+    node._tick()
+
+    assert receiver.drain_calls == initial_drain_calls + 3
+    assert receiver.pending == []
+    assert node._core.stats.real_valid_packets == 310
+    assert len(publisher.messages) == initial_publications + 1
+
+
+def test_node_bounds_drain_batches_under_continuous_ingress(monkeypatch):
+    node, _receiver, publisher, clock = ready_controlled_node(monkeypatch)
+    receiver = ReplenishingReceiver(identity_payload())
+    node._receiver = receiver
+    initial_publications = len(publisher.messages)
+    clock[0] = 600_000_000
+
+    node._tick()
+
+    assert receiver.drain_calls == receiver.maximum_safe_calls
+    assert node._core.stats.real_valid_packets == 26
     assert len(publisher.messages) == initial_publications + 1
 
 

@@ -62,6 +62,9 @@ SOURCE_METADATA_DTYPES = {
 }
 
 
+_MAX_RECEIVER_DRAIN_BATCHES_PER_TICK = 16
+
+
 def validate_source_params(
     raw: Mapping[str, object], *, mod_root: Path | None = None
 ) -> dict[str, object]:
@@ -678,23 +681,27 @@ class ZeroLabSourceNode(Node):
         if self._closed:
             return
         received_valid = False
-        for datagram in self._receiver.drain():
-            try:
-                packet = parse_zerolab_packet(
-                    datagram.payload,
-                    receive_timestamp_ns=datagram.receive_timestamp_ns,
-                    local_frame_index=datagram.local_frame_index,
-                    sender_address=datagram.sender_address,
-                )
-            except ZeroLabProtocolError as exc:
-                self._invalid_packets += 1
-                self.get_logger().warning(
-                    f"skipped invalid ZeroLab packet: {exc}"
-                )
-                continue
-            received_valid = True
-            self._record_valid_packet_if_enabled(packet)
-            self._core.accept(packet)
+        for _ in range(_MAX_RECEIVER_DRAIN_BATCHES_PER_TICK):
+            datagrams = self._receiver.drain()
+            if not datagrams:
+                break
+            for datagram in datagrams:
+                try:
+                    packet = parse_zerolab_packet(
+                        datagram.payload,
+                        receive_timestamp_ns=datagram.receive_timestamp_ns,
+                        local_frame_index=datagram.local_frame_index,
+                        sender_address=datagram.sender_address,
+                    )
+                except ZeroLabProtocolError as exc:
+                    self._invalid_packets += 1
+                    self.get_logger().warning(
+                        f"skipped invalid ZeroLab packet: {exc}"
+                    )
+                    continue
+                received_valid = True
+                self._record_valid_packet_if_enabled(packet)
+                self._core.accept(packet)
 
         now_ns = time.monotonic_ns()
         self._core.check_stale(now_ns)
