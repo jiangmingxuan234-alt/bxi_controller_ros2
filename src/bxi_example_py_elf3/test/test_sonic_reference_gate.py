@@ -54,6 +54,12 @@ def frame(value, *, root=None):
         newest_frame_index=int(value) + 9,
         valid_horizon=10,
         clamp_slots=0,
+        source_generation=77,
+        latest_real_frame_index=int(value) + 9,
+        latest_real_receive_timestamp_ns=1_000_000_000 + int(value),
+        real_valid_frames_in_generation=10,
+        real_stream_ready=True,
+        playout_kind=0,
     )
 
 
@@ -102,6 +108,18 @@ def test_interpolation_corrects_quaternion_hemisphere():
         np.array([0.9238795, 0.0, 0.0, 0.3826834]),
         atol=1e-6,
     )
+    assert blended.source_generation == end.source_generation
+    assert blended.latest_real_frame_index == end.latest_real_frame_index
+    assert (
+        blended.latest_real_receive_timestamp_ns
+        == end.latest_real_receive_timestamp_ns
+    )
+    assert (
+        blended.real_valid_frames_in_generation
+        == end.real_valid_frames_in_generation
+    )
+    assert blended.real_stream_ready is end.real_stream_ready
+    assert blended.playout_kind == end.playout_kind
 
 
 def test_copy_smpl_reference_does_not_alias_arrays():
@@ -121,6 +139,45 @@ def test_copy_smpl_reference_does_not_alias_arrays():
     ):
         assert getattr(copied, name) is not getattr(original, name)
         np.testing.assert_array_equal(getattr(copied, name), getattr(original, name))
+    for name in (
+        "source_generation",
+        "latest_real_frame_index",
+        "latest_real_receive_timestamp_ns",
+        "real_valid_frames_in_generation",
+        "real_stream_ready",
+        "playout_kind",
+        "source_stale",
+    ):
+        assert getattr(copied, name) == getattr(original, name)
+
+
+def test_hold_retains_source_metadata_without_aliasing_arrays():
+    gate = LiveReferenceGate()
+    gate.observe(frame(3), received_mono=1.0)
+    observed = gate.observed_reference
+
+    assert gate.hold() is True
+    held = gate.active_reference()
+
+    assert held is not None and observed is not None
+    for name in (
+        "term1_local",
+        "root_quat",
+        "wrist",
+        "head_joint_pos",
+    ):
+        assert getattr(held, name) is not getattr(observed, name)
+        np.testing.assert_array_equal(getattr(held, name), getattr(observed, name))
+    for name in (
+        "source_generation",
+        "latest_real_frame_index",
+        "latest_real_receive_timestamp_ns",
+        "real_valid_frames_in_generation",
+        "real_stream_ready",
+        "playout_kind",
+        "source_stale",
+    ):
+        assert getattr(held, name) == getattr(observed, name)
 
 
 @pytest.mark.parametrize("alpha", [-0.01, 1.01, np.nan, np.inf])

@@ -84,6 +84,9 @@ class SonicPolicy(Protocol):
     def has_fresh_live_reference(self, timeout_s: float | None = None) -> bool:
         ...
 
+    def live_reference_recovery_ready(self, required_real_frames: int) -> bool:
+        ...
+
     def hold_live_reference(self) -> bool:
         ...
 

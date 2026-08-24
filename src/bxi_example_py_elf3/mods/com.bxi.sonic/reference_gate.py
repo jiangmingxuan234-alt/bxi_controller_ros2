@@ -19,6 +19,12 @@ class SmplReferenceFrame:
     frame_index: int = -1
     sequence: int = 0
     stream_epoch: Optional[int] = None
+    source_generation: Optional[int] = None
+    latest_real_frame_index: Optional[int] = None
+    latest_real_receive_timestamp_ns: Optional[int] = None
+    real_valid_frames_in_generation: Optional[int] = None
+    real_stream_ready: Optional[bool] = None
+    playout_kind: Optional[int] = None
     source_stale: bool = False
     source_age_ms: Optional[float] = None
     playback_hold: bool = False
