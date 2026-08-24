@@ -533,11 +533,16 @@ reference 时进入。因为可用性检查发生在 state-scoped 节点 prepare
 需要把 `pico_manager` 和 `smpl_bridge` 都改成 `lifecycle: mod`，让 PICO 数据流在状态
 切换请求之前已经运行。
 
-## ZeroLab 实时遥操（ELF3 网线适配）
+## ZeroLab 实时遥操（ELF3 无线适配）
 
-当前 ELF3 网线适配固定条件：MotionCaptureMaster 关闭镜像；Windows 有线端为
-`192.168.1.52`；以 50 Hz、每包 992 字节向机器人 Ubuntu
-`192.168.1.51:18000` 发送 UDP。开始前必须在
+当前无线分支的唯一活动路由为：MotionCaptureMaster 关闭镜像；Windows sender
+`192.168.89.171` 以 50 Hz、每包 992 字节向机器人无线地址
+`192.168.88.172:18000` 发送 UDP。直接网线版本仍保留在提交 `a82e5f4`，其 Windows
+sender 为 `192.168.1.52`、机器人 receiver 为 `192.168.1.51:18000`。无线分支和
+`a82e5f4` 必须使用各自单独的工作树及 build/install；不要把一个版本的 sender、配置或
+构建产物用于另一路由，也不要同时启用两条路由。
+
+开始前必须在
 ZeroLab 厂家软件完成 N-pose 标定并回到中立姿势；UDP 的 world quaternion 已是厂家
 标定后的数据。应用不执行运行时 T-pose、静止姿势或其他人体重标定。ZeroLab 状态使用
 `btn_10=11`，不会启动 PICO manager、RoboticsService、RTSP 或夹爪/头部控制；PICO
@@ -594,20 +599,31 @@ sleep 1
 
 ```text
 vendor N-pose -> operator neutral -> btn_10=11 -> WAIT_STREAM
--> WAIT_ARM -> btn_10=12 -> 2 s BLENDING -> ARMED
+-> WAIT_ARM -> initial btn_10=12 -> 2 s BLENDING -> ARMED
 
-ARMED + stale -> HOLD_REFERENCE
-HOLD_REFERENCE + recovered stream -> still gated
-HOLD_REFERENCE + btn_10=12 -> 2 s REARMING -> ARMED
+gap <= 0.5 s: 80 ms buffered playout -> held reference if needed
+-> automatic 0.2 s short recovery -> remains ARMED
+
+gap > 0.5 s: HOLD_REFERENCE -> 10 new real valid UDP packets
+-> automatic 2 s REARMING -> ARMED
 ```
 
-`btn_10=11` 后，ZeroLab source/bridge 与 SONIC policy 在后台运行。source 连续收到
-严格的 10 帧完整数据后才进入 `WAIT_ARM`；在 `WAIT_STREAM` 和 `WAIT_ARM` 中，电机输出
-由零速度 Normal policy 每周期实时更新，而不是重复一张 Normal 快照。初次 ARM 时，系统
-在 2.0 秒内将实时 Normal 与实时 SONIC 输出混合，之后才进入 `ARMED`。live reference/source
-连续 0.5 s 未更新即视为 stale；如果这发生在初次 `BLENDING`，系统取消初次 ARM、重置为
-`WAIT_STREAM`，并立即回到实时零速度 Normal 输出。重新满足严格连续 10 帧后才会再次进入
-`WAIT_ARM`，不能由旧数据直接接管。
+ `btn_10=11` 后，ZeroLab source/bridge 与 SONIC policy 在后台运行。source 连续收到
+ 严格的 10 帧完整数据后才进入 `WAIT_ARM`；在 `WAIT_STREAM` 和 `WAIT_ARM` 中，电机输出
+ 由零速度 Normal policy 每周期实时更新，而不是重复一张 Normal 快照。初次 ARM 时，系统
+需要一次显式 `btn_10=12`，在 2.0 秒内将实时 Normal 与实时 SONIC 输出混合，之后才进入
+`ARMED`。新鲜度边界是严格的 `> 0.5 s`：最后一个真实有效 UDP 包的接收年龄等于
+`0.5 s` 时不 stale，只有超过 `0.5 s` 才切换 generation 并进入 stale。若初次
+`BLENDING` 中发生 stale，系统取消初次 ARM、重置为 `WAIT_STREAM`，并立即回到实时零速度
+Normal 输出；新 generation 重新满足 10 个真实有效包后只回到 `WAIT_ARM`，不能由旧数据
+或合成帧直接接管。安全员必须重新确认中立姿势并再次发送初次 ARM；只有初次 blend 成功到达
+`ARMED` 后，后续 dropout 恢复才无需第二次 ARM。
+
+`ARMED` 中的 80 ms jitter buffer 在 50 Hz playout 时钟上做真实帧或插值输出；短缺包时
+可暂时保持最后 reference。未越过 stale 边界而恢复真实输入时，系统自动执行 0.2 秒
+reference-space 短恢复并保持 `ARMED`。插值、保持和短恢复输出都不是网络新鲜度证据；只有
+真实有效 UDP 包会更新 `latest_real_receive_timestamp_ns`、增加新 generation 的
+`real_valid_frames_in_generation` 并证明网络恢复。
 
 等待终端1显示 source、bridge 已就绪并进入 `WAIT_ARM`：
 
@@ -638,16 +654,51 @@ ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{}'
 ```
 
 ARM 后的 2.0 秒交接期间继续保持中立姿态。两秒 blend 可以减小指令跳变，但不能纠正错误的
-目标姿态。`ARMED` 中连续 0.5 s 未更新的 live reference/source 会进入 `HOLD_REFERENCE`：
+目标姿态。`ARMED` 中真实输入年龄严格超过 0.5 s 会进入 `HOLD_REFERENCE`：
 系统保持已接受的人体 reference，继续使用 SONIC 与当前本体感知闭环平衡，并非冻结最后一张
-电机命令。新鲜输入恢复后仍处于待授权状态；安全员必须再次发送 `btn_10=12`，系统才在
-reference space 内执行 2.0 秒 `REARMING` 后回到 `ARMED`。系统不会自动进入 PD brake，
-也不会自动恢复人体控制。
+电机命令。此时必须收到同一新 generation 的 10 个真实有效 UDP 包；随后系统无需第二次
+ARM 按键，自动在 reference space 内执行 2.0 秒 `REARMING` 并回到 `ARMED`。默认
+`auto_rearm_on_recovery: true` 时，初次 ARM 之后再发送 `btn_10=12` 不会重启
+`HOLD_REFERENCE`、`REARMING` 或 `ARMED` 阶段。
 
-MuJoCo acceptance 必须覆盖 0.6 s、2 s 和 30 s 的 dropout：确认 `WAIT_STREAM`/`WAIT_ARM`
-持续实时 Normal、初次 2.0 秒 blend，以及 `HOLD_REFERENCE` 后的显式 rearm。硬件仍然禁止，
-直至这些 MuJoCo acceptance 项全部通过，并且独立确认 CAN 与 `motor_timeout` clearance；
-通过其中一项不解除另一项硬件阻断。
+自动恢复没有人体 pose-difference gate，也不会验证操作者恢复后的姿势是否接近断流前姿势。
+如果 sender 长时间断开，操作者必须先主动回到中立姿势，再有意恢复 sender。没有支撑架、可用
+急停和独立安全观察员时，禁止在硬件上使用这种无条件自动恢复；blend 不能代替上述安全条件，
+系统也不会因 dropout 自动进入 PD brake。
+
+每次 source 状态变化时以及每 5 秒会打印精确格式的统计行：
+
+```text
+ZeroLab source stats; real_valid_packets=... maximum_real_arrival_gap_ms=... stale_events=... interpolated_output_frames=... held_output_frames=... dropped_backlog_frames=... invalid_packets=... dropped_publications=...
+```
+
+其中 `real_valid_packets` 只累计转换并进入 resampler 的真实包；
+`maximum_real_arrival_gap_ms` 是本次 source 生命周期观察到的最大真实接收间隔；每次跨越严格
+stale 边界时 `stale_events` 加一；三个 playout 计数分别记录插值输出、保持输出和丢弃的积压
+输入帧；`invalid_packets` 只记录通过 receiver 后解析失败的包，不包含 receiver 在 992 字节
+长度或 sender IP 过滤处拒绝的 datagram；`dropped_publications` 记录 ZMQ 非阻塞发送失败。
+状态侧每次成功开始自动 rearm 后将会话内 `auto_rearm_count` 加一（重新 prepare/exit 会清零），
+它不包含在上面的 source 统计行中。关键状态日志为：
+
+```text
+ZeroLab input stale; holding playout with source_stale=1
+ZeroLab reference stale; holding human reference while SONIC balance continues
+ZeroLab automatic recovery; ARM phase: REARMING for 2.000 s
+ZeroLab automatic recovery complete; ARM phase: ARMED
+```
+
+已知 wire 协议限制：datagram 必须正好 992 字节，payload 本身没有 sender sequence、sender
+timestamp、版本、校验和、认证、加密或重传；frame index 和 monotonic timestamp 都由 receiver
+按本机接收顺序生成，因此不能从 wire metadata 识别上游乱序或丢包。`allowed_sender` 只过滤源
+IP，不认证源端口或发送者身份。UDP receiver 每个 20 ms tick 会分批读取并反复 drain，直到
+socket 明确耗尽后才 sample，因此有限 backlog 会先全部排空；如果无限持续 ingress 的速度使
+socket 永远不耗尽，timer/sample 可能饥饿。这是本配置接受的限制，sender 必须保持 50 Hz，
+不得用持续 flood 做运行模式。
+
+MuJoCo acceptance 必须覆盖 0.10 s、0.49 s、0.51 s、2.0 s 和 30.0 s 的 dropout：确认
+`WAIT_STREAM`/`WAIT_ARM` 持续实时 Normal、初次 2.0 秒 blend、短 gap 保持 `ARMED`，以及
+长 gap 的 10 个真实包门槛与自动 2.0 秒 rearm。硬件仍然禁止，直至这些 MuJoCo acceptance
+项全部通过，并且独立确认 CAN 与 `motor_timeout` clearance；通过其中一项不解除另一项硬件阻断。
 
 检查状态和三个监听端口：
 

@@ -258,6 +258,28 @@ def test_stale_is_strictly_greater_than_half_second_and_changes_generation():
     assert core.stats.stale_events == 1
 
 
+@pytest.mark.parametrize("gap_s", [0.10, 0.49])
+def test_short_gap_does_not_cross_source_stale_barrier(gap_s):
+    core = ready_core(generations=(101, 202))
+    last_real_ns = core.latest_real_receive_timestamp_ns
+    now_ns = last_real_ns + int(gap_s * 1.0e9)
+    assert core.check_stale(now_ns) is False
+    fields = core.sample(now_ns)
+    assert fields is not None
+    assert int(fields["source_generation"][0]) == 101
+    assert int(fields["source_stale"][0]) == 0
+
+
+@pytest.mark.parametrize("gap_s", [0.51, 2.0, 30.0])
+def test_long_gap_crosses_one_stale_generation_barrier(gap_s):
+    core = ready_core(generations=(101, 202))
+    last_real_ns = core.latest_real_receive_timestamp_ns
+    assert core.check_stale(last_real_ns + int(gap_s * 1.0e9)) is True
+    assert core.source_generation == 202
+    assert core.real_valid_frames_in_generation == 0
+    assert core.stats.stale_events == 1
+
+
 def test_conversion_exception_preserves_last_real_authority():
     core = core_with_fake_generation(101)
     assert core.accept(identity_packet(0))

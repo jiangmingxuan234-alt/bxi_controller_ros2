@@ -519,6 +519,24 @@ def test_previously_armed_hold_auto_rearms_after_ten_real_frames():
     assert sonic.rearm_attempts == 1
 
 
+@pytest.mark.parametrize("real_frames", range(10))
+def test_hold_does_not_auto_rearm_before_ten_real_frames(real_frames):
+    state, sonic, _normal, ctx = reference_hold_state()
+    sonic.fresh = True
+    sonic.recovery_ready = real_frames >= 10
+    state.sample_running_frame(ctx, 0.02, advance=True)
+    assert state.arm_phase is ZeroLabArmPhase.HOLD_REFERENCE
+
+
+def test_tenth_real_frame_auto_rearms_without_second_arm_action():
+    state, sonic, _normal, ctx = reference_hold_state()
+    sonic.fresh = True
+    sonic.recovery_ready = True
+    state.sample_running_frame(ctx, 0.02, advance=True)
+    assert state.arm_phase is ZeroLabArmPhase.REARMING
+    assert sonic.rearm_attempts == 1
+
+
 def test_auto_rearm_count_increments_only_after_gate_rearm_succeeds():
     state, sonic, _normal, ctx = reference_hold_state()
     sonic.fresh = True
