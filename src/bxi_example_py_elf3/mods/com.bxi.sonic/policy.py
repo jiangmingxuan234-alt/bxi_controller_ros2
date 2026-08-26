@@ -1164,6 +1164,24 @@ class SonicTeleopPolicy(JointPolicy):
             self.source_transition_from = None
         return np.asarray(blended, dtype=np.float32)
 
+    def record_applied_joint_target(self, applied_qpos: object) -> None:
+        """Record the preceding applied qpos in model action coordinates."""
+        qpos = np.asarray(applied_qpos)
+        if qpos.shape != (NUM_JOINTS,) or not np.isfinite(qpos).all():
+            raise ValueError(
+                "applied joint target must contain exactly 29 finite values"
+            )
+        normalized = (
+            qpos.astype(np.float32, copy=False) - self.default_dof_pos
+        ) / self.action_scale
+        if not np.isfinite(normalized).all():
+            raise ValueError("normalized applied joint target must be finite")
+        np.copyto(
+            self.last_action,
+            np.clip(normalized, -ACTION_CLIP, ACTION_CLIP),
+            casting="same_kind",
+        )
+
     def _update_history(
         self, q: np.ndarray, dq: np.ndarray, quat_wxyz: np.ndarray, omega: np.ndarray
     ) -> np.ndarray:

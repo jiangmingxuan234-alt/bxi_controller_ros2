@@ -55,6 +55,7 @@ SonicTeleopPolicy = policy_module.SonicTeleopPolicy
 WINDOW = merger_module.WINDOW
 NUM_JOINTS = policy_module.NUM_JOINTS
 MODEL_INPUT_DIM = policy_module.MODEL_INPUT_DIM
+ACTION_CLIP = policy_module.ACTION_CLIP
 SonicTeleopState = state_module.SonicTeleopState
 
 
@@ -221,6 +222,43 @@ def _observation():
         np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float64),
         np.zeros(3, dtype=np.float32),
     )
+
+
+def test_record_applied_joint_target_normalizes_clips_and_preserves_output(
+    monkeypatch,
+):
+    policy = _make_policy(monkeypatch)
+    output_before = policy.target_dof_pos.copy()
+    normalized = np.linspace(-25.0, 25.0, NUM_JOINTS, dtype=np.float32)
+    applied = policy.default_dof_pos + normalized * policy.action_scale
+
+    policy.record_applied_joint_target(applied)
+
+    np.testing.assert_allclose(
+        policy.last_action,
+        np.clip(normalized, -ACTION_CLIP, ACTION_CLIP),
+        atol=1e-6,
+    )
+    np.testing.assert_array_equal(policy.target_dof_pos, output_before)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        np.zeros(NUM_JOINTS - 1, dtype=np.float32),
+        np.zeros(NUM_JOINTS + 1, dtype=np.float32),
+        np.full(NUM_JOINTS, np.nan, dtype=np.float32),
+        np.full(NUM_JOINTS, np.inf, dtype=np.float32),
+    ],
+)
+def test_record_applied_joint_target_rejects_invalid_input(monkeypatch, value):
+    policy = _make_policy(monkeypatch)
+    before = policy.last_action.copy()
+
+    with pytest.raises(ValueError, match="29 finite"):
+        policy.record_applied_joint_target(value)
+
+    np.testing.assert_array_equal(policy.last_action, before)
 
 
 def test_missing_canfd_packet_disables_only_optional_gripper(monkeypatch):
