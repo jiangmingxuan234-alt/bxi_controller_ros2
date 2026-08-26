@@ -6,9 +6,11 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from bxi_example_py_elf3.framework.joints import CompiledJointMap, JointLayout
 from bxi_example_py_elf3.framework.mod_api import ResourceHandle
 from bxi_example_py_elf3.framework.mod_api.transition import MotorFrame
 from bxi_example_py_elf3.policies import HumanoidGaitPolicyLiteIsaaclab
+from bxi_example_py_elf3.policies.joints import ELF3_POLICY_JOINTS
 
 from ..state import SonicTeleopState
 
@@ -89,6 +91,10 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
         self._auto_rearm_count = 0
         self._recovery_notice_logged = False
         self._phase_logged = False
+        self._applied_target_map = None
+        self._applied_policy_qpos = np.empty(
+            ELF3_POLICY_JOINTS.dof_num, dtype=np.float32
+        )
 
     @property
     def arm_phase(self) -> ZeroLabArmPhase:
@@ -107,6 +113,21 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
             vel=source.vel,
             torque=source.torque,
         )
+
+    def _prepare_applied_target_mapping(self, source_layout: JointLayout) -> None:
+        self._applied_target_map = CompiledJointMap.compile(
+            source_layout,
+            ELF3_POLICY_JOINTS,
+        )
+
+    def _record_previous_applied_target(self, frame: MotorFrame) -> None:
+        mapping = self._applied_target_map
+        if mapping is None:
+            raise RuntimeError("ZeroLab applied-target mapping is not prepared")
+        if frame.layout != mapping.source:
+            raise ValueError("previous motor frame layout changed during ZeroLab")
+        mapping.map_into(frame.qpos, self._applied_policy_qpos)
+        self.policy.record_applied_joint_target(self._applied_policy_qpos)
 
     def _set_phase(
         self,
@@ -134,6 +155,7 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
         self._applied_frame = MotorFrame.empty(ctx.robot_layout)
         self._live_frame = MotorFrame.empty(ctx.robot_layout)
         self._normal_frame = MotorFrame.empty(ctx.robot_layout)
+        self._prepare_applied_target_mapping(ctx.last_motor_frame.layout)
         self._copy_frame(self._entry_frame, ctx.last_motor_frame)
         self._copy_frame(self._applied_frame, ctx.last_motor_frame)
         self._blend_elapsed_s = 0.0
@@ -220,6 +242,7 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
             )
             self.policy.set_live_reference_rearm_progress(alpha)
 
+        self._record_previous_applied_target(ctx.last_motor_frame)
         natural_frame = super().sample_running_frame(ctx, dt, advance=True)
         ctx.resolve_motor_frame(natural_frame, self._live_frame)
         fresh_reference = self.policy.has_fresh_live_reference(
@@ -361,6 +384,8 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
         self._applied_frame = None
         self._live_frame = None
         self._normal_frame = None
+        self._applied_target_map = None
+        self._applied_policy_qpos.fill(0.0)
         self._blend_elapsed_s = 0.0
         self._initial_arm_completed = False
         self._auto_rearm_count = 0

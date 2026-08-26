@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from bxi_example_py_elf3.framework.inference import PolicyOutput
-from bxi_example_py_elf3.framework.joints import JointTargetBuffer
+from bxi_example_py_elf3.framework.joints import JointLayout, JointTargetBuffer
 from bxi_example_py_elf3.framework.mod_api.transition import MotorFrame
 from bxi_example_py_elf3.policies.joints import ELF3_POLICY_JOINTS
 from zerolab.converter import ZeroLabMotionConverter
@@ -70,6 +70,8 @@ class FakePolicy:
         self.rearm_progress = 0.0
         self.held_rearm_progress = None
         self.rearm_progress_at_step = []
+        self.applied_targets = []
+        self.call_order = []
         self.head_joint_target = np.zeros(2, dtype=np.float32)
         self.last_status = "idle_reference"
 
@@ -82,9 +84,16 @@ class FakePolicy:
     def reset(self, _frame=None):
         self.step_calls = 0
         self.rearm_progress_at_step.clear()
+        self.applied_targets.clear()
+        self.call_order.clear()
+
+    def record_applied_joint_target(self, qpos):
+        self.applied_targets.append(np.asarray(qpos, dtype=np.float32).copy())
+        self.call_order.append("record")
 
     def step(self, _frame, _dt, *, advance=True):
         if advance:
+            self.call_order.append("step")
             self.step_calls += 1
             self.rearm_progress_at_step.append(self.rearm_progress)
         return self.output
@@ -317,6 +326,102 @@ def prepared_state(
     )
     state.on_prepare(ctx, object())
     return state, sonic, normal, ctx
+
+
+def test_advancing_tick_records_previous_applied_target_before_sonic_step():
+    state, sonic, _normal, ctx = prepared_state(entry_value=0.25)
+    previous = ctx.last_motor_frame.qpos.copy()
+
+    state.sample_running_frame(ctx, 0.02, advance=True)
+
+    assert sonic.call_order[:2] == ["record", "step"]
+    np.testing.assert_array_equal(sonic.applied_targets[-1], previous)
+
+
+def test_non_advancing_tick_does_not_record_or_step():
+    state, sonic, _normal, ctx = prepared_state(entry_value=0.25)
+    state.sample_running_frame(ctx, 0.02, advance=True)
+    recorded = len(sonic.applied_targets)
+    steps = sonic.step_calls
+
+    state.sample_running_frame(ctx, 0.02, advance=False)
+
+    assert len(sonic.applied_targets) == recorded
+    assert sonic.step_calls == steps
+
+
+def test_applied_target_mapping_uses_joint_names_and_allows_extra_joint():
+    state, sonic, _normal, _ctx = prepared_state()
+    names = tuple(reversed(ELF3_POLICY_JOINTS.names)) + ("extra_joint",)
+    layout = JointLayout(names, label="reordered robot")
+    values = np.asarray(
+        [
+            float(ELF3_POLICY_JOINTS.index(name))
+            if name in ELF3_POLICY_JOINTS.names
+            else 999.0
+            for name in names
+        ],
+        dtype=np.float32,
+    )
+    frame = MotorFrame.create(
+        layout,
+        values,
+        np.ones(layout.dof_num, dtype=np.float32),
+        np.ones(layout.dof_num, dtype=np.float32),
+    )
+
+    state._prepare_applied_target_mapping(frame.layout)
+    state._record_previous_applied_target(frame)
+
+    np.testing.assert_array_equal(
+        sonic.applied_targets[-1],
+        np.arange(ELF3_POLICY_JOINTS.dof_num, dtype=np.float32),
+    )
+
+
+def test_applied_target_mapping_rejects_missing_policy_joint():
+    state, _sonic, _normal, _ctx = prepared_state()
+    incomplete = JointLayout(
+        ELF3_POLICY_JOINTS.names[:-1], label="incomplete robot"
+    )
+
+    with pytest.raises(ValueError, match="missing joints"):
+        state._prepare_applied_target_mapping(incomplete)
+
+
+@pytest.mark.parametrize(
+    "phase_name",
+    [
+        "wait_stream",
+        "wait_arm",
+        "blending",
+        "armed",
+        "hold_reference",
+        "rearming",
+    ],
+)
+def test_every_zerolab_phase_records_previous_applied_target(phase_name):
+    state, sonic, _normal, ctx = state_in_phase(phase_name)
+    marker = np.linspace(0.01, 0.29, 29, dtype=np.float32)
+    ctx.last_motor_frame.qpos[:] = marker
+
+    state.sample_running_frame(ctx, 0.001, advance=True)
+
+    np.testing.assert_array_equal(sonic.applied_targets[-1], marker)
+
+
+def test_blending_records_the_preceding_applied_blend():
+    state, sonic, _normal, ctx = waiting_arm_state()
+    assert state.on_action(ctx, "arm_zerolab") is True
+    sonic.target.position.fill(2.0)
+    previous_blend = copy_motor_frame(
+        state.sample_running_frame(ctx, 1.0, advance=True)
+    )
+    ctx.last_motor_frame.qpos[:] = previous_blend.qpos
+
+    state.sample_running_frame(ctx, 0.1, advance=True)
+
+    np.testing.assert_allclose(sonic.applied_targets[-1], previous_blend.qpos)
 
 
 def armed_state_at_half_blend():
