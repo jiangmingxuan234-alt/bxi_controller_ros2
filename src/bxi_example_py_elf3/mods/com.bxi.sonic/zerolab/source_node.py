@@ -44,7 +44,7 @@ SOURCE_DEFAULTS: dict[str, object] = {
     "rate_hz": 50.0,
     "window_frames": 10,
     "stale_seconds": 0.5,
-    "jitter_buffer_seconds": 0.08,
+    "jitter_buffer_seconds": 0.04,
     "short_recovery_blend_seconds": 0.2,
     "recovery_real_frames": 10,
     "record_path": "",
@@ -262,7 +262,7 @@ class ZeroLabSourceCore:
             raise ValueError("recovery_real_frames must be a positive integer")
         self._converter = converter
         self._resampler = resampler or ZeroLabPoseResampler(
-            jitter_buffer_seconds=0.08,
+            jitter_buffer_seconds=0.04,
             short_recovery_blend_seconds=0.2,
             output_rate_hz=50.0,
         )

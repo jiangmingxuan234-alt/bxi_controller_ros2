@@ -43,7 +43,7 @@ def test_zerolab_nodes_have_distinct_upstream_and_mutually_exclusive_states():
     assert source["allowed_sender"] == "192.168.89.171"
     assert source["pose_host"] == "127.0.0.1"
     assert source["pose_port"] == 5558
-    assert source["jitter_buffer_seconds"] == 0.08
+    assert source["jitter_buffer_seconds"] == 0.04
     assert source["short_recovery_blend_seconds"] == 0.2
     assert source["stale_seconds"] == 0.5
     assert source["recovery_real_frames"] == 10

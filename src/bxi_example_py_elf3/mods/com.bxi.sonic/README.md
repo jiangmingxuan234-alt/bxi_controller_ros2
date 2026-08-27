@@ -601,7 +601,7 @@ sleep 1
 vendor N-pose -> operator neutral -> btn_10=11 -> WAIT_STREAM
 -> WAIT_ARM -> initial btn_10=12 -> 2 s BLENDING -> ARMED
 
-gap <= 0.5 s: 80 ms buffered playout -> held reference if needed
+gap <= 0.5 s: 40 ms buffered playout -> held reference if needed
 -> automatic 0.2 s short recovery -> remains ARMED
 
 gap > 0.5 s: HOLD_REFERENCE -> 10 new real valid UDP packets
@@ -619,7 +619,7 @@ Normal 输出；新 generation 重新满足 10 个真实有效包后只回到 `W
 或合成帧直接接管。安全员必须重新确认中立姿势并再次发送初次 ARM；只有初次 blend 成功到达
 `ARMED` 后，后续 dropout 恢复才无需第二次 ARM。
 
-`ARMED` 中的 80 ms jitter buffer 在 50 Hz playout 时钟上做真实帧或插值输出；短缺包时
+`ARMED` 中的 40 ms jitter buffer 在 50 Hz playout 时钟上做真实帧或插值输出；短缺包时
 可暂时保持最后 reference。未越过 stale 边界而恢复真实输入时，系统自动执行 0.2 秒
 reference-space 短恢复并保持 `ARMED`。插值、保持和短恢复输出都不是网络新鲜度证据；只有
 真实有效 UDP 包会更新 `latest_real_receive_timestamp_ns`、增加新 generation 的
