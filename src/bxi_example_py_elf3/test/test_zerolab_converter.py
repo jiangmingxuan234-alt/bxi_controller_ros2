@@ -256,6 +256,16 @@ def test_converter_emits_first_vendor_calibrated_packet():
     np.testing.assert_allclose(output.smpl_body_pose, 0.0, atol=1e-6)
 
 
+def test_converter_uses_optional_sample_timestamp_only_for_resampling():
+    converter = ZeroLabMotionConverter()
+    packet = make_packet(0, identity47())
+
+    output = converter.observe(packet, sample_timestamp_ns=123_456_789)
+
+    assert packet.receive_timestamp_ns == 0
+    assert output.receive_timestamp_ns == 123_456_789
+
+
 def test_converter_maps_vendor_world_pose_without_sampled_rest_inverse():
     vendor = identity47()
     vendor[3] = Rotation.from_euler("z", 30.0, degrees=True).as_quat()

@@ -1,6 +1,7 @@
 """Vendor-calibrated ZeroLab-to-SONIC pose conversion."""
 
 from dataclasses import dataclass
+import operator
 
 import numpy as np
 from numpy.typing import NDArray
@@ -161,8 +162,16 @@ class ZeroLabMotionConverter:
     def reset_session(self) -> None:
         self._previous_raw_quats_xyzw = None
 
-    def observe(self, packet: ZeroLabPacket) -> ConvertedPoseFrame:
+    def observe(
+        self,
+        packet: ZeroLabPacket,
+        *,
+        sample_timestamp_ns: int | None = None,
+    ) -> ConvertedPoseFrame:
         """Observe a vendor-calibrated packet and return its SONIC frame."""
+        if sample_timestamp_ns is None:
+            sample_timestamp_ns = packet.receive_timestamp_ns
+        sample_timestamp_ns = operator.index(sample_timestamp_ns)
         raw_quats = unity_world_quaternions_to_xrt(
             packet.joint_quat_world_xyzw, _PACKET_QUATERNION_SHAPE
         )
@@ -202,7 +211,7 @@ class ZeroLabMotionConverter:
         self._previous_raw_quats_xyzw = raw_quats
         return ConvertedPoseFrame(
             frame_index=int(packet.local_frame_index),
-            receive_timestamp_ns=int(packet.receive_timestamp_ns),
+            receive_timestamp_ns=int(sample_timestamp_ns),
             smpl_body_pose=smpl_body_pose,
             smpl_joints=smpl_joints,
             body_quat_w=body_quat_w,

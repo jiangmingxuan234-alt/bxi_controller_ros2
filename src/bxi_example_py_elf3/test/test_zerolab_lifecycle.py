@@ -26,6 +26,7 @@ from zerolab.source_node import (
     ZeroLabSourceNode,
     validate_source_params,
 )
+from zerolab.timeline import BurstTimelineReconstructor
 from zerolab.udp_receiver import DrainBatch, ReceivedDatagram, ZeroLabUdpReceiver
 
 
@@ -252,6 +253,19 @@ class CapturingPublisher:
         self.messages.append(deepcopy(fields))
 
 
+class ObservingResampler:
+    def __init__(self, delegate):
+        self._delegate = delegate
+        self.observed_timestamps_ns = []
+
+    def observe(self, frame):
+        self.observed_timestamps_ns.append(frame.receive_timestamp_ns)
+        return self._delegate.observe(frame)
+
+    def __getattr__(self, name):
+        return getattr(self._delegate, name)
+
+
 class CapturingLogger:
     def __init__(self):
         self.infos = []
@@ -313,6 +327,7 @@ def make_controlled_node(monkeypatch):
     node._receiver = receiver
     node._converter = ZeroLabMotionConverter()
     node._core = make_test_core()
+    node._timeline = BurstTimelineReconstructor(rate_hz=50.0)
     node._publisher = publisher
     node._writer = None
     node._recording_enabled = False
@@ -324,6 +339,30 @@ def make_controlled_node(monkeypatch):
     node._last_stats_log_ns = 0
     node.get_logger = lambda: logger
     return node, receiver, publisher, clock_ns
+
+
+def test_node_reconstructs_burst_sample_timeline_without_falsifying_freshness(
+    monkeypatch,
+):
+    node, receiver, _publisher, clock_ns = make_controlled_node(monkeypatch)
+    resampler = ObservingResampler(node._core._resampler)
+    node._core._resampler = resampler
+    for frame_index, timestamp_ns in enumerate(
+        (1_000_000_000, 1_000_100_000, 1_000_200_000)
+    ):
+        receiver.queue(frame_index, timestamp_ns)
+    clock_ns[0] = 1_080_200_000
+
+    node._tick()
+
+    assert resampler.observed_timestamps_ns == [
+        960_200_000,
+        980_200_000,
+        1_000_200_000,
+    ]
+    assert node._core.latest_real_receive_timestamp_ns == 1_000_200_000
+    assert node._core.stats.maximum_real_arrival_gap_ms == pytest.approx(0.1)
+    assert node._timeline.stats.redistributed_packets == 2
 
 
 def ready_controlled_node(monkeypatch):
@@ -509,6 +548,8 @@ def test_source_statistics_are_bounded_to_five_seconds_and_include_counters(
         "interpolated_output_frames=",
         "held_output_frames=",
         "dropped_backlog_frames=",
+        "timeline_redistributed_packets=",
+        "maximum_timeline_adjustment_ms=",
         "invalid_packets=0",
         "dropped_publications=0",
     ):
@@ -544,6 +585,7 @@ def test_malformed_packet_never_reaches_core_accept(monkeypatch):
     node._closed = False
     node._receiver = receiver
     node._core = RejectMalformedCore()
+    node._timeline = BurstTimelineReconstructor(rate_hz=50.0)
     node._publisher = CapturingPublisher()
     node._writer = None
     node._recording_enabled = False

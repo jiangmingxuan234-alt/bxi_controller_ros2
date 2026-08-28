@@ -669,13 +669,17 @@ ARM 按键，自动在 reference space 内执行 2.0 秒 `REARMING` 并回到 `A
 每次 source 状态变化时以及每 5 秒会打印精确格式的统计行：
 
 ```text
-ZeroLab source stats; real_valid_packets=... maximum_real_arrival_gap_ms=... stale_events=... interpolated_output_frames=... held_output_frames=... dropped_backlog_frames=... invalid_packets=... dropped_publications=...
+ZeroLab source stats; real_valid_packets=... maximum_real_arrival_gap_ms=... stale_events=... interpolated_output_frames=... held_output_frames=... dropped_backlog_frames=... timeline_redistributed_packets=... maximum_timeline_adjustment_ms=... invalid_packets=... dropped_publications=...
 ```
 
 其中 `real_valid_packets` 只累计转换并进入 resampler 的真实包；
 `maximum_real_arrival_gap_ms` 是本次 source 生命周期观察到的最大真实接收间隔；每次跨越严格
 stale 边界时 `stale_events` 加一；三个 playout 计数分别记录插值输出、保持输出和丢弃的积压
-输入帧；`invalid_packets` 只记录通过 receiver 后解析失败的包，不包含 receiver 在 992 字节
+输入帧。当前 wire 协议没有 sender timestamp/sequence，因此 source 会把同一次 drain 中聚集的
+有效包以 50 Hz 从最新真实到达时刻向后展开；这条重建时间轴只供 resampler 使用，不替换 stale、
+source age、录包和网络统计中的真实接收时间。`timeline_redistributed_packets` 是被展开包的累计数，
+`maximum_timeline_adjustment_ms` 是单包时间轴调整的生命周期最大值；二者只能诊断机器人接收端
+聚包，不能恢复 sender 端丢包或证明真实采样时刻。`invalid_packets` 只记录通过 receiver 后解析失败的包，不包含 receiver 在 992 字节
 长度或 sender IP 过滤处拒绝的 datagram；`dropped_publications` 记录 ZMQ 非阻塞发送失败。
 状态侧每次成功开始自动 rearm 后将会话内 `auto_rearm_count` 加一（重新 prepare/exit 会清零），
 它不包含在上面的 source 统计行中。关键状态日志为：
@@ -688,8 +692,9 @@ ZeroLab automatic recovery complete; ARM phase: ARMED
 ```
 
 已知 wire 协议限制：datagram 必须正好 992 字节，payload 本身没有 sender sequence、sender
-timestamp、版本、校验和、认证、加密或重传；frame index 和 monotonic timestamp 都由 receiver
-按本机接收顺序生成，因此不能从 wire metadata 识别上游乱序或丢包。`allowed_sender` 只过滤源
+timestamp、版本、校验和、认证、加密或重传；frame index 和真实 receive timestamp 都由 receiver
+按本机接收顺序生成，因此不能从 wire metadata 识别上游乱序或丢包。上述重建 sample timestamp
+只是 50 Hz fallback，不等价于 sender capture timestamp。`allowed_sender` 只过滤源
 IP，不认证源端口或发送者身份。UDP receiver 每个 20 ms tick 会分批读取并反复 drain，直到
 socket 明确耗尽后才 sample，因此有限 backlog 会先全部排空；如果无限持续 ingress 的速度使
 socket 永远不耗尽，timer/sample 可能饥饿。这是本配置接受的限制，sender 必须保持 50 Hz，

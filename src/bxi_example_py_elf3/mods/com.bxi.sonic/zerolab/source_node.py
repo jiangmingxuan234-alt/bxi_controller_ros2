@@ -24,6 +24,7 @@ from .recording import (
     RawRecordingWriter,
     build_recording_metadata,
 )
+from .timeline import BurstTimelineReconstructor
 from .udp_receiver import ZeroLabUdpReceiver
 
 if __package__ == "zerolab":
@@ -353,7 +354,7 @@ class ZeroLabSourceCore:
         self._stale_event_pending = False
         return pending
 
-    def accept(self, packet) -> bool:
+    def accept(self, packet, *, sample_timestamp_ns: int | None = None) -> bool:
         timestamp_ns = operator.index(packet.receive_timestamp_ns)
         if (
             self._latest_real_receive_timestamp_ns is not None
@@ -363,7 +364,9 @@ class ZeroLabSourceCore:
         ):
             self._mark_stale()
 
-        frame = self._converter.observe(packet)
+        frame = self._converter.observe(
+            packet, sample_timestamp_ns=sample_timestamp_ns
+        )
         if not self._resampler.observe(frame):
             return False
 
@@ -507,6 +510,7 @@ class ZeroLabSourceNode(Node):
         self._receiver = None
         self._converter = None
         self._core = None
+        self._timeline = None
         self._publisher = None
         self._timer = None
         self._writer = None
@@ -543,6 +547,9 @@ class ZeroLabSourceNode(Node):
                 window_frames=int(params["window_frames"]),
                 stale_seconds=float(params["stale_seconds"]),
                 recovery_real_frames=int(params["recovery_real_frames"]),
+            )
+            self._timeline = BurstTimelineReconstructor(
+                rate_hz=float(params["rate_hz"])
             )
             self._publisher = ZeroLabPosePublisher(
                 str(params["pose_host"]),
@@ -659,6 +666,7 @@ class ZeroLabSourceNode(Node):
             return
         source_stats = self._core.stats
         resampler_stats = self._core._resampler.stats
+        timeline_stats = self._timeline.stats
         self.get_logger().info(
             "ZeroLab source stats; "
             f"real_valid_packets={source_stats.real_valid_packets} "
@@ -669,6 +677,10 @@ class ZeroLabSourceNode(Node):
             f"{resampler_stats.interpolated_output_frames} "
             f"held_output_frames={resampler_stats.held_output_frames} "
             f"dropped_backlog_frames={resampler_stats.dropped_backlog_frames} "
+            "timeline_redistributed_packets="
+            f"{timeline_stats.redistributed_packets} "
+            "maximum_timeline_adjustment_ms="
+            f"{timeline_stats.maximum_adjustment_ns / 1_000_000.0:.3f} "
             f"invalid_packets={self._invalid_packets} "
             f"dropped_publications={self._dropped_publications}"
         )
@@ -678,6 +690,7 @@ class ZeroLabSourceNode(Node):
         if self._closed:
             return
         received_valid = False
+        valid_packets = []
         while True:
             batch = self._receiver.drain()
             for datagram in batch.datagrams:
@@ -696,9 +709,21 @@ class ZeroLabSourceNode(Node):
                     continue
                 received_valid = True
                 self._record_valid_packet_if_enabled(packet)
-                self._core.accept(packet)
+                valid_packets.append(packet)
             if batch.exhausted:
                 break
+
+        sample_timestamps_ns = self._timeline.reconstruct_batch(
+            tuple(
+                packet.receive_timestamp_ns for packet in valid_packets
+            )
+        )
+        for packet, sample_timestamp_ns in zip(
+            valid_packets, sample_timestamps_ns
+        ):
+            self._core.accept(
+                packet, sample_timestamp_ns=sample_timestamp_ns
+            )
 
         now_ns = time.monotonic_ns()
         self._core.check_stale(now_ns)
