@@ -240,6 +240,163 @@ class ZeroLabSourceStats:
     stale_events: int = 0
 
 
+@dataclass(frozen=True)
+class SourceTimingSnapshot:
+    """One bounded diagnostics window for the source timer callback."""
+
+    tick_count: int = 0
+    interval_count: int = 0
+    total_tick_interval_ns: int = 0
+    maximum_tick_interval_ns: int = 0
+    maximum_tick_lateness_ns: int = 0
+    missed_tick_periods: int = 0
+    total_callback_work_ns: int = 0
+    maximum_callback_work_ns: int = 0
+    maximum_receive_duration_ns: int = 0
+    maximum_parse_duration_ns: int = 0
+    maximum_convert_duration_ns: int = 0
+    maximum_sample_publish_duration_ns: int = 0
+    drained_packets: int = 0
+    maximum_packets_per_tick: int = 0
+
+    @property
+    def effective_hz(self) -> float:
+        if self.interval_count == 0 or self.total_tick_interval_ns == 0:
+            return 0.0
+        return (
+            self.interval_count * 1_000_000_000.0
+            / self.total_tick_interval_ns
+        )
+
+    @property
+    def average_callback_work_ns(self) -> float:
+        if self.tick_count == 0:
+            return 0.0
+        return self.total_callback_work_ns / self.tick_count
+
+
+class SourceTimingDiagnostics:
+    """Accumulate timer cadence and callback stage costs between logs."""
+
+    def __init__(self, *, period_ns: int) -> None:
+        period_ns = operator.index(period_ns)
+        if period_ns <= 0:
+            raise ValueError("period_ns must be positive")
+        self._period_ns = period_ns
+        self._reset()
+
+    def _reset(self) -> None:
+        self._tick_count = 0
+        self._interval_count = 0
+        self._total_tick_interval_ns = 0
+        self._maximum_tick_interval_ns = 0
+        self._maximum_tick_lateness_ns = 0
+        self._missed_tick_periods = 0
+        self._total_callback_work_ns = 0
+        self._maximum_callback_work_ns = 0
+        self._maximum_receive_duration_ns = 0
+        self._maximum_parse_duration_ns = 0
+        self._maximum_convert_duration_ns = 0
+        self._maximum_sample_publish_duration_ns = 0
+        self._drained_packets = 0
+        self._maximum_packets_per_tick = 0
+        self._last_tick_start_ns = None
+
+    def record_tick(
+        self,
+        *,
+        tick_start_ns: int,
+        tick_end_ns: int,
+        receive_duration_ns: int,
+        parse_duration_ns: int,
+        convert_duration_ns: int,
+        sample_publish_duration_ns: int,
+        drained_packets: int,
+    ) -> None:
+        tick_start_ns = operator.index(tick_start_ns)
+        tick_end_ns = operator.index(tick_end_ns)
+        durations = tuple(
+            operator.index(value)
+            for value in (
+                receive_duration_ns,
+                parse_duration_ns,
+                convert_duration_ns,
+                sample_publish_duration_ns,
+            )
+        )
+        drained_packets = operator.index(drained_packets)
+        if tick_end_ns < tick_start_ns or any(value < 0 for value in durations):
+            raise ValueError("timing values must be non-negative and ordered")
+        if drained_packets < 0:
+            raise ValueError("drained_packets must be non-negative")
+
+        if self._last_tick_start_ns is not None:
+            interval_ns = tick_start_ns - self._last_tick_start_ns
+            if interval_ns < 0:
+                raise ValueError("tick_start_ns must be monotonic")
+            self._interval_count += 1
+            self._total_tick_interval_ns += interval_ns
+            self._maximum_tick_interval_ns = max(
+                self._maximum_tick_interval_ns, interval_ns
+            )
+            self._maximum_tick_lateness_ns = max(
+                self._maximum_tick_lateness_ns,
+                max(0, interval_ns - self._period_ns),
+            )
+            self._missed_tick_periods += max(
+                0, interval_ns // self._period_ns - 1
+            )
+
+        callback_work_ns = tick_end_ns - tick_start_ns
+        self._tick_count += 1
+        self._total_callback_work_ns += callback_work_ns
+        self._maximum_callback_work_ns = max(
+            self._maximum_callback_work_ns, callback_work_ns
+        )
+        self._maximum_receive_duration_ns = max(
+            self._maximum_receive_duration_ns, durations[0]
+        )
+        self._maximum_parse_duration_ns = max(
+            self._maximum_parse_duration_ns, durations[1]
+        )
+        self._maximum_convert_duration_ns = max(
+            self._maximum_convert_duration_ns, durations[2]
+        )
+        self._maximum_sample_publish_duration_ns = max(
+            self._maximum_sample_publish_duration_ns, durations[3]
+        )
+        self._drained_packets += drained_packets
+        self._maximum_packets_per_tick = max(
+            self._maximum_packets_per_tick, drained_packets
+        )
+        self._last_tick_start_ns = tick_start_ns
+
+    def snapshot(self) -> SourceTimingSnapshot:
+        return SourceTimingSnapshot(
+            tick_count=self._tick_count,
+            interval_count=self._interval_count,
+            total_tick_interval_ns=self._total_tick_interval_ns,
+            maximum_tick_interval_ns=self._maximum_tick_interval_ns,
+            maximum_tick_lateness_ns=self._maximum_tick_lateness_ns,
+            missed_tick_periods=self._missed_tick_periods,
+            total_callback_work_ns=self._total_callback_work_ns,
+            maximum_callback_work_ns=self._maximum_callback_work_ns,
+            maximum_receive_duration_ns=self._maximum_receive_duration_ns,
+            maximum_parse_duration_ns=self._maximum_parse_duration_ns,
+            maximum_convert_duration_ns=self._maximum_convert_duration_ns,
+            maximum_sample_publish_duration_ns=(
+                self._maximum_sample_publish_duration_ns
+            ),
+            drained_packets=self._drained_packets,
+            maximum_packets_per_tick=self._maximum_packets_per_tick,
+        )
+
+    def snapshot_and_reset(self) -> SourceTimingSnapshot:
+        snapshot = self.snapshot()
+        self._reset()
+        return snapshot
+
+
 class ZeroLabSourceCore:
     """Apply stale-stream semantics around ZeroLab conversion and chunking."""
 
@@ -522,6 +679,9 @@ class ZeroLabSourceNode(Node):
         self._stream_state = None
         self._last_stale_log_generation = None
         self._last_stats_log_ns = 0
+        self._timing = SourceTimingDiagnostics(
+            period_ns=int(1_000_000_000 / float(params["rate_hz"]))
+        )
         self._closed = False
         self._destroy_result = True
 
@@ -667,6 +827,7 @@ class ZeroLabSourceNode(Node):
         source_stats = self._core.stats
         resampler_stats = self._core._resampler.stats
         timeline_stats = self._timeline.stats
+        timing_stats = self._timing.snapshot_and_reset()
         self.get_logger().info(
             "ZeroLab source stats; "
             f"real_valid_packets={source_stats.real_valid_packets} "
@@ -682,17 +843,45 @@ class ZeroLabSourceNode(Node):
             "maximum_timeline_adjustment_ms="
             f"{timeline_stats.maximum_adjustment_ns / 1_000_000.0:.3f} "
             f"invalid_packets={self._invalid_packets} "
-            f"dropped_publications={self._dropped_publications}"
+            f"dropped_publications={self._dropped_publications} "
+            f"timing_ticks={timing_stats.tick_count} "
+            f"timing_effective_hz={timing_stats.effective_hz:.3f} "
+            "maximum_tick_interval_ms="
+            f"{timing_stats.maximum_tick_interval_ns / 1_000_000.0:.3f} "
+            "maximum_tick_lateness_ms="
+            f"{timing_stats.maximum_tick_lateness_ns / 1_000_000.0:.3f} "
+            f"missed_tick_periods={timing_stats.missed_tick_periods} "
+            "average_callback_work_ms="
+            f"{timing_stats.average_callback_work_ns / 1_000_000.0:.3f} "
+            "maximum_callback_work_ms="
+            f"{timing_stats.maximum_callback_work_ns / 1_000_000.0:.3f} "
+            "maximum_receive_ms="
+            f"{timing_stats.maximum_receive_duration_ns / 1_000_000.0:.3f} "
+            "maximum_parse_ms="
+            f"{timing_stats.maximum_parse_duration_ns / 1_000_000.0:.3f} "
+            "maximum_convert_ms="
+            f"{timing_stats.maximum_convert_duration_ns / 1_000_000.0:.3f} "
+            "maximum_sample_publish_ms="
+            f"{timing_stats.maximum_sample_publish_duration_ns / 1_000_000.0:.3f} "
+            f"drained_packets_window={timing_stats.drained_packets} "
+            "maximum_packets_per_tick="
+            f"{timing_stats.maximum_packets_per_tick}"
         )
         self._last_stats_log_ns = now_ns
 
     def _tick(self) -> None:
         if self._closed:
             return
+        tick_start_ns = time.perf_counter_ns()
+        receive_duration_ns = 0
+        parse_duration_ns = 0
         received_valid = False
         valid_packets = []
         while True:
+            receive_start_ns = time.perf_counter_ns()
             batch = self._receiver.drain()
+            receive_duration_ns += time.perf_counter_ns() - receive_start_ns
+            parse_start_ns = time.perf_counter_ns()
             for datagram in batch.datagrams:
                 try:
                     packet = parse_zerolab_packet(
@@ -710,9 +899,11 @@ class ZeroLabSourceNode(Node):
                 received_valid = True
                 self._record_valid_packet_if_enabled(packet)
                 valid_packets.append(packet)
+            parse_duration_ns += time.perf_counter_ns() - parse_start_ns
             if batch.exhausted:
                 break
 
+        convert_start_ns = time.perf_counter_ns()
         sample_timestamps_ns = self._timeline.reconstruct_batch(
             tuple(
                 packet.receive_timestamp_ns for packet in valid_packets
@@ -724,7 +915,9 @@ class ZeroLabSourceNode(Node):
             self._core.accept(
                 packet, sample_timestamp_ns=sample_timestamp_ns
             )
+        convert_duration_ns = time.perf_counter_ns() - convert_start_ns
 
+        sample_publish_start_ns = time.perf_counter_ns()
         now_ns = time.monotonic_ns()
         self._core.check_stale(now_ns)
         became_stale = self._core.consume_stale_event()
@@ -734,6 +927,9 @@ class ZeroLabSourceNode(Node):
                 self._publisher.send(fields)
             except zmq.Again:
                 self._dropped_publications += 1
+        sample_publish_duration_ns = (
+            time.perf_counter_ns() - sample_publish_start_ns
+        )
 
         transitioned = False
         if became_stale:
@@ -753,6 +949,16 @@ class ZeroLabSourceNode(Node):
             )
         ):
             transitioned = self._set_stream_state("collecting")
+        tick_end_ns = time.perf_counter_ns()
+        self._timing.record_tick(
+            tick_start_ns=tick_start_ns,
+            tick_end_ns=tick_end_ns,
+            receive_duration_ns=receive_duration_ns,
+            parse_duration_ns=parse_duration_ns,
+            convert_duration_ns=convert_duration_ns,
+            sample_publish_duration_ns=sample_publish_duration_ns,
+            drained_packets=len(valid_packets),
+        )
         self._log_stats(now_ns, force=transitioned)
 
     def _close_with_warning(self, name: str, close_resource) -> None:
@@ -795,6 +1001,8 @@ __all__ = [
     "PoseChunkWindow",
     "SOURCE_DEFAULTS",
     "SOURCE_METADATA_DTYPES",
+    "SourceTimingDiagnostics",
+    "SourceTimingSnapshot",
     "ZeroLabPosePublisher",
     "ZeroLabSourceCore",
     "ZeroLabSourceStats",

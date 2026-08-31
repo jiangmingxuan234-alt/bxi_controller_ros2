@@ -19,6 +19,7 @@ from bxi_example_py_elf3.framework.runtime.mod_nodes import (
     ModNodeSpec,
 )
 from pico.pose_to_smpl_ref_bridge import SmplRefBridgeNode
+import zerolab.source_node as source_node_module
 from zerolab.converter import ZeroLabMotionConverter
 from zerolab.resampler import ZeroLabPoseResampler
 from zerolab.source_node import (
@@ -314,6 +315,62 @@ def make_test_core():
     )
 
 
+def test_source_timing_diagnostics_reports_rate_lateness_and_stage_costs():
+    diagnostics_class = getattr(
+        source_node_module, "SourceTimingDiagnostics", None
+    )
+    assert diagnostics_class is not None, (
+        "ZeroLab source timing diagnostics are missing"
+    )
+    diagnostics = diagnostics_class(period_ns=20_000_000)
+
+    diagnostics.record_tick(
+        tick_start_ns=0,
+        tick_end_ns=10_000_000,
+        receive_duration_ns=1_000_000,
+        parse_duration_ns=2_000_000,
+        convert_duration_ns=5_000_000,
+        sample_publish_duration_ns=2_000_000,
+        drained_packets=1,
+    )
+    diagnostics.record_tick(
+        tick_start_ns=20_000_000,
+        tick_end_ns=35_000_000,
+        receive_duration_ns=3_000_000,
+        parse_duration_ns=1_000_000,
+        convert_duration_ns=7_000_000,
+        sample_publish_duration_ns=4_000_000,
+        drained_packets=3,
+    )
+    diagnostics.record_tick(
+        tick_start_ns=60_000_000,
+        tick_end_ns=72_000_000,
+        receive_duration_ns=2_000_000,
+        parse_duration_ns=2_000_000,
+        convert_duration_ns=6_000_000,
+        sample_publish_duration_ns=2_000_000,
+        drained_packets=2,
+    )
+
+    snapshot = diagnostics.snapshot_and_reset()
+    assert snapshot.tick_count == 3
+    assert snapshot.effective_hz == pytest.approx(100.0 / 3.0)
+    assert snapshot.maximum_tick_interval_ns == 40_000_000
+    assert snapshot.maximum_tick_lateness_ns == 20_000_000
+    assert snapshot.missed_tick_periods == 1
+    assert snapshot.average_callback_work_ns == pytest.approx(
+        37_000_000 / 3.0
+    )
+    assert snapshot.maximum_callback_work_ns == 15_000_000
+    assert snapshot.maximum_receive_duration_ns == 3_000_000
+    assert snapshot.maximum_parse_duration_ns == 2_000_000
+    assert snapshot.maximum_convert_duration_ns == 7_000_000
+    assert snapshot.maximum_sample_publish_duration_ns == 4_000_000
+    assert snapshot.drained_packets == 6
+    assert snapshot.maximum_packets_per_tick == 3
+    assert diagnostics.snapshot().tick_count == 0
+
+
 def make_controlled_node(monkeypatch):
     clock_ns = [0]
     monkeypatch.setattr(
@@ -337,6 +394,9 @@ def make_controlled_node(monkeypatch):
     node._stream_state = None
     node._last_stale_log_generation = None
     node._last_stats_log_ns = 0
+    node._timing = source_node_module.SourceTimingDiagnostics(
+        period_ns=20_000_000
+    )
     node.get_logger = lambda: logger
     return node, receiver, publisher, clock_ns
 
@@ -552,6 +612,19 @@ def test_source_statistics_are_bounded_to_five_seconds_and_include_counters(
         "maximum_timeline_adjustment_ms=",
         "invalid_packets=0",
         "dropped_publications=0",
+        "timing_ticks=",
+        "timing_effective_hz=",
+        "maximum_tick_interval_ms=",
+        "maximum_tick_lateness_ms=",
+        "missed_tick_periods=",
+        "average_callback_work_ms=",
+        "maximum_callback_work_ms=",
+        "maximum_receive_ms=",
+        "maximum_parse_ms=",
+        "maximum_convert_ms=",
+        "maximum_sample_publish_ms=",
+        "drained_packets_window=",
+        "maximum_packets_per_tick=",
     ):
         assert counter in stats[0]
 
@@ -593,6 +666,9 @@ def test_malformed_packet_never_reaches_core_accept(monkeypatch):
     node._dropped_publications = 0
     node._stream_state = "collecting"
     node._last_stats_log_ns = 0
+    node._timing = source_node_module.SourceTimingDiagnostics(
+        period_ns=20_000_000
+    )
     node.get_logger = lambda: logger
 
     node._tick()
