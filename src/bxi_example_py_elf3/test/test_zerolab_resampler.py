@@ -53,12 +53,26 @@ def test_sample_coalesces_calls_inside_configured_output_period():
     resampler.observe(frame(1, 10_000_000, 1.0))
 
     first = resampler.sample(80_000_000)
-    assert resampler.sample(89_999_999) is None
+    assert resampler.sample(89_000_000) is None
     second = resampler.sample(90_000_000)
 
     assert first.frame.frame_index == 0
     assert second.frame.frame_index == 1
     assert second.frame.receive_timestamp_ns == 10_000_000
+
+
+def test_timer_jitter_near_50_hz_period_does_not_halve_playout_rate():
+    resampler = make_resampler()
+    resampler.observe(frame(0, 0, 0.0))
+    timer_jitter_ns = (0, -200_000, 100_000, -150_000, 180_000, -100_000)
+
+    outputs = [
+        resampler.sample(80_000_000 + index * 20_000_000 + jitter_ns)
+        for index, jitter_ns in enumerate(timer_jitter_ns)
+    ]
+
+    assert all(output is not None for output in outputs)
+    assert [output.frame.frame_index for output in outputs] == list(range(6))
 
 
 def test_jittered_samples_interpolate_continuous_fields():

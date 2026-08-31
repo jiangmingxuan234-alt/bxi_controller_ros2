@@ -141,6 +141,9 @@ class ZeroLabPoseResampler:
         self._jitter_buffer_ns = int(jitter_buffer_seconds * 1_000_000_000)
         self._short_blend_ns = int(short_recovery_blend_seconds * 1_000_000_000)
         self._output_period_ns = int(1_000_000_000 / output_rate_hz)
+        self._output_early_tolerance_ns = min(
+            1_000_000, self._output_period_ns // 20
+        )
         self.reset()
 
     @property
@@ -170,11 +173,13 @@ class ZeroLabPoseResampler:
         if isinstance(now_ns, bool) or not isinstance(now_ns, Integral):
             raise ValueError("now_ns must be an integer")
         now_ns = int(now_ns)
-        if (
-            self._last_output_now_ns is not None
-            and now_ns - self._last_output_now_ns < self._output_period_ns
-        ):
-            return None
+        if self._last_output_now_ns is not None:
+            elapsed_ns = now_ns - self._last_output_now_ns
+            if (
+                elapsed_ns + self._output_early_tolerance_ns
+                < self._output_period_ns
+            ):
+                return None
         target_ns = now_ns - self._jitter_buffer_ns
         target_frame, target_kind, left = self._select_target(target_ns)
         if left is not None:
