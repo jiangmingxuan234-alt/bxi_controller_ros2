@@ -55,6 +55,31 @@ DTYPE_MAP = {
     "u8": np.dtype("u1"),
     "bool": np.dtype("?"),
 }
+ZERO_LAB_SOURCE_METADATA = {
+    "source_generation": (
+        np.dtype(np.int64),
+        1,
+        int(np.iinfo(np.int64).max),
+    ),
+    "latest_real_frame_index": (
+        np.dtype(np.int64),
+        0,
+        int(np.iinfo(np.int64).max),
+    ),
+    "latest_real_receive_timestamp_ns": (
+        np.dtype(np.int64),
+        1,
+        int(np.iinfo(np.int64).max),
+    ),
+    "real_valid_frames_in_generation": (
+        np.dtype(np.int32),
+        0,
+        int(np.iinfo(np.int32).max),
+    ),
+    "real_stream_ready": (np.dtype(np.uint8), 0, 1),
+    "playout_kind": (np.dtype(np.uint8), 0, 3),
+    "source_stale": (np.dtype(np.uint8), 0, 1),
+}
 
 # The packaged PICO manager writes directly to the ELF3 29-DoF joint order.
 # Export the six wrist joints as:
@@ -240,6 +265,39 @@ def _extract_wrist_frames(joint_pos: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(jp[:, ELF3_NATIVE_WRIST_IDX], dtype=np.float32)
 
 
+def _parse_optional_source_metadata(
+    fields: dict[str, np.ndarray],
+) -> dict[str, np.ndarray] | None:
+    """Validate the complete optional ZeroLab source-authority contract."""
+
+    present = set(fields).intersection(ZERO_LAB_SOURCE_METADATA)
+    if not present:
+        return None
+    missing = set(ZERO_LAB_SOURCE_METADATA) - present
+    if missing:
+        raise ValueError(
+            "ZeroLab source metadata must be complete; "
+            f"missing={sorted(missing)}"
+        )
+
+    metadata: dict[str, np.ndarray] = {}
+    for name, (dtype, minimum, maximum) in ZERO_LAB_SOURCE_METADATA.items():
+        value = np.asarray(fields[name])
+        if value.shape != (1,) or value.dtype != dtype:
+            raise ValueError(
+                f"ZeroLab source metadata {name} must be scalar {dtype}; "
+                f"got shape={value.shape} dtype={value.dtype}"
+            )
+        scalar = int(value[0])
+        if not minimum <= scalar <= maximum:
+            raise ValueError(
+                f"ZeroLab source metadata {name} must be in "
+                f"[{minimum}, {maximum}]; got {scalar}"
+            )
+        metadata[name] = np.array(value, copy=True)
+    return metadata
+
+
 def _parse_incoming_chunk(fields: dict[str, np.ndarray]) -> IncomingChunk:
     missing = [
         k
@@ -321,9 +379,10 @@ def _source_chunk_fields(
     *,
     source_stream_epoch: int,
     received_monotonic_ns: int,
+    source_metadata: dict[str, np.ndarray] | None = None,
 ) -> dict[str, np.ndarray]:
     """Build the one-way rolling chunk consumed by the policy merger."""
-    return {
+    source_fields = {
         "source_chunk": np.asarray([1], dtype=np.uint8),
         "source_stream_epoch": np.asarray(
             [source_stream_epoch], dtype=np.int64
@@ -347,6 +406,12 @@ def _source_chunk_fields(
         "valid_horizon": np.asarray([WINDOW], dtype=np.int32),
         "clamp_slots": np.asarray([0], dtype=np.int32),
     }
+    if source_metadata is not None:
+        metadata = _parse_optional_source_metadata(source_metadata)
+        if metadata is None:
+            raise ValueError("ZeroLab source metadata cannot be empty")
+        source_fields.update(metadata)
+    return source_fields
 
 
 def _validated_params(raw: dict[str, object]) -> dict[str, object]:
@@ -397,6 +462,8 @@ class SmplRefBridgeNode(Node):
         self._last_received_mono: float | None = None
         self._last_valid_newest_frame: int | None = None
         self._source_stream_epoch = new_stream_epoch()
+        self._source_generation: int | None = None
+        self._seen_source_generations: set[int] = set()
         self._received = 0
         self._sent = 0
         self._skipped = 0
@@ -470,6 +537,34 @@ class SmplRefBridgeNode(Node):
             self._publish_buttons(fields)
             self._received += 1
             received_mono = time.monotonic()
+            try:
+                source_metadata = _parse_optional_source_metadata(fields)
+            except (TypeError, ValueError) as exc:
+                self._skipped += 1
+                self.get_logger().warning(
+                    f"skipped invalid ZeroLab source metadata: {exc}"
+                )
+                continue
+
+            source_generation: int | None = None
+            if source_metadata is not None:
+                source_generation = int(source_metadata["source_generation"][0])
+                if (
+                    source_generation != self._source_generation
+                    and source_generation in self._seen_source_generations
+                ):
+                    self._skipped += 1
+                    self.get_logger().warning(
+                        "skipped delayed ZeroLab generation "
+                        f"{source_generation}; current={self._source_generation}"
+                    )
+                    continue
+                if source_generation != self._source_generation:
+                    self._seen_source_generations.add(source_generation)
+                    self._source_generation = source_generation
+            else:
+                self._source_generation = None
+
             if not self._source_gate.observe(
                 fields,
                 received_mono,
@@ -493,19 +588,31 @@ class SmplRefBridgeNode(Node):
                 self._duplicate_chunks += 1
                 continue
             if progress == "restart":
-                previous_epoch = self._source_stream_epoch
-                self._source_stream_epoch = new_stream_epoch(previous_epoch)
                 self._counter_restarts += 1
-                self.get_logger().info(
-                    "PICO frame counter restarted; "
-                    f"newest={newest} previous={self._last_valid_newest_frame} "
-                    f"source_epoch={previous_epoch}->{self._source_stream_epoch}"
-                )
+                if source_metadata is None:
+                    previous_epoch = self._source_stream_epoch
+                    self._source_stream_epoch = new_stream_epoch(previous_epoch)
+                    self.get_logger().info(
+                        "PICO frame counter restarted; "
+                        f"newest={newest} previous={self._last_valid_newest_frame} "
+                        f"source_epoch={previous_epoch}->{self._source_stream_epoch}"
+                    )
+                else:
+                    self.get_logger().info(
+                        "ZeroLab output frame counter restarted; "
+                        f"newest={newest} previous={self._last_valid_newest_frame} "
+                        f"source_generation={source_generation}"
+                    )
 
             source_fields = _source_chunk_fields(
                 chunk,
-                source_stream_epoch=self._source_stream_epoch,
+                source_stream_epoch=(
+                    self._source_stream_epoch
+                    if source_generation is None
+                    else source_generation
+                ),
                 received_monotonic_ns=int(received_mono * 1.0e9),
+                source_metadata=source_metadata,
             )
             try:
                 self._pub.send(
@@ -596,6 +703,8 @@ __all__ = [
     "IncomingChunk",
     "PicoSourceReadinessGate",
     "SmplRefBridgeNode",
+    "ZERO_LAB_SOURCE_METADATA",
+    "_parse_optional_source_metadata",
     "_source_chunk_fields",
     "create_node",
 ]

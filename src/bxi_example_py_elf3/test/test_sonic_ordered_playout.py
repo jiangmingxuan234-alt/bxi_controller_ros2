@@ -10,6 +10,8 @@ from types import ModuleType, SimpleNamespace
 import numpy as np
 import pytest
 
+from zerolab.resampler import PlayoutKind
+
 
 MOD_ROOT = (
     Path(__file__).resolve().parents[1] / "mods" / "com.bxi.sonic"
@@ -53,7 +55,19 @@ SonicTeleopPolicy = policy_module.SonicTeleopPolicy
 WINDOW = merger_module.WINDOW
 NUM_JOINTS = policy_module.NUM_JOINTS
 MODEL_INPUT_DIM = policy_module.MODEL_INPUT_DIM
+ACTION_CLIP = policy_module.ACTION_CLIP
 SonicTeleopState = state_module.SonicTeleopState
+
+
+ZERO_LAB_METADATA_NAMES = {
+    "source_generation",
+    "latest_real_frame_index",
+    "latest_real_receive_timestamp_ns",
+    "real_valid_frames_in_generation",
+    "real_stream_ready",
+    "playout_kind",
+    "source_stale",
+}
 
 
 class _FakeBackend:
@@ -115,6 +129,32 @@ def _source_fields(start: int, *, epoch: int = 1):
         "valid_horizon": np.asarray([WINDOW], dtype=np.int32),
         "clamp_slots": np.asarray([0], dtype=np.int32),
     }
+
+
+def _zerolab_metadata(
+    *, generation, latest_real_ns=None, real_frames=10, ready=True,
+    playout_kind=PlayoutKind.REAL, stale=False,
+):
+    return {
+        "source_generation": np.asarray([generation], dtype=np.int64),
+        "latest_real_frame_index": np.asarray([real_frames - 1], dtype=np.int64),
+        "latest_real_receive_timestamp_ns": np.asarray(
+            [time.monotonic_ns() if latest_real_ns is None else latest_real_ns],
+            dtype=np.int64,
+        ),
+        "real_valid_frames_in_generation": np.asarray(
+            [real_frames], dtype=np.int32
+        ),
+        "real_stream_ready": np.asarray([int(ready)], dtype=np.uint8),
+        "playout_kind": np.asarray([int(playout_kind)], dtype=np.uint8),
+        "source_stale": np.asarray([int(stale)], dtype=np.uint8),
+    }
+
+
+def _zerolab_source_fields(start, *, generation):
+    fields = _source_fields(start, epoch=generation)
+    fields.update(_zerolab_metadata(generation=generation))
+    return fields
 
 
 def _manager_fields(start: int, count: int = WINDOW):
@@ -184,6 +224,43 @@ def _observation():
     )
 
 
+def test_record_applied_joint_target_normalizes_clips_and_preserves_output(
+    monkeypatch,
+):
+    policy = _make_policy(monkeypatch)
+    output_before = policy.target_dof_pos.copy()
+    normalized = np.linspace(-25.0, 25.0, NUM_JOINTS, dtype=np.float32)
+    applied = policy.default_dof_pos + normalized * policy.action_scale
+
+    policy.record_applied_joint_target(applied)
+
+    np.testing.assert_allclose(
+        policy.last_action,
+        np.clip(normalized, -ACTION_CLIP, ACTION_CLIP),
+        atol=1e-6,
+    )
+    np.testing.assert_array_equal(policy.target_dof_pos, output_before)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        np.zeros(NUM_JOINTS - 1, dtype=np.float32),
+        np.zeros(NUM_JOINTS + 1, dtype=np.float32),
+        np.full(NUM_JOINTS, np.nan, dtype=np.float32),
+        np.full(NUM_JOINTS, np.inf, dtype=np.float32),
+    ],
+)
+def test_record_applied_joint_target_rejects_invalid_input(monkeypatch, value):
+    policy = _make_policy(monkeypatch)
+    before = policy.last_action.copy()
+
+    with pytest.raises(ValueError, match="29 finite"):
+        policy.record_applied_joint_target(value)
+
+    np.testing.assert_array_equal(policy.last_action, before)
+
+
 def test_missing_canfd_packet_disables_only_optional_gripper(monkeypatch):
     monkeypatch.delattr(state_module.bxi_msg, "CANFDPacket", raising=False)
     monkeypatch.delattr(state_module.bxi_msg, "CanfdPacket", raising=False)
@@ -250,6 +327,69 @@ def test_bridge_schema_is_one_way_complete_chunk_without_ack():
     )
 
 
+def test_bridge_preserves_complete_zerolab_source_metadata():
+    incoming = _manager_fields(100)
+    incoming.update(
+        _zerolab_metadata(generation=77, real_frames=10, ready=True)
+    )
+    chunk = bridge_module._parse_incoming_chunk(incoming)
+    metadata = bridge_module._parse_optional_source_metadata(incoming)
+    fields = bridge_module._source_chunk_fields(
+        chunk,
+        source_stream_epoch=77,
+        received_monotonic_ns=999,
+        source_metadata=metadata,
+    )
+    for name in ZERO_LAB_METADATA_NAMES:
+        np.testing.assert_array_equal(fields[name], incoming[name])
+
+
+def test_bridge_rejects_partial_or_invalid_zerolab_metadata():
+    fields = _manager_fields(0)
+    fields["source_generation"] = np.asarray([7], dtype=np.int64)
+    with pytest.raises(ValueError, match="metadata"):
+        bridge_module._parse_optional_source_metadata(fields)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    (
+        ("source_generation", np.asarray([0], dtype=np.int64)),
+        ("latest_real_frame_index", np.asarray([-1], dtype=np.int64)),
+        (
+            "latest_real_receive_timestamp_ns",
+            np.asarray([0], dtype=np.int64),
+        ),
+        (
+            "real_valid_frames_in_generation",
+            np.asarray([-1], dtype=np.int32),
+        ),
+        ("real_stream_ready", np.asarray([2], dtype=np.uint8)),
+        ("playout_kind", np.asarray([4], dtype=np.uint8)),
+        ("source_stale", np.asarray([2], dtype=np.uint8)),
+        ("source_generation", np.asarray([7], dtype=np.int32)),
+        ("source_generation", np.asarray([7, 8], dtype=np.int64)),
+    ),
+)
+def test_bridge_rejects_invalid_zerolab_metadata_scalar(name, value):
+    fields = _manager_fields(0)
+    fields.update(_zerolab_metadata(generation=7))
+    fields[name] = value
+    with pytest.raises(ValueError, match="metadata"):
+        bridge_module._parse_optional_source_metadata(fields)
+
+
+def test_metadata_free_pico_schema_is_byte_compatible_in_fields():
+    chunk = bridge_module._parse_incoming_chunk(_manager_fields(0))
+    fields = bridge_module._source_chunk_fields(
+        chunk,
+        source_stream_epoch=7,
+        received_monotonic_ns=123,
+        source_metadata=None,
+    )
+    assert not any(name in fields for name in ZERO_LAB_METADATA_NAMES)
+
+
 def test_bridge_rejects_incomplete_or_nonconsecutive_source_windows():
     with pytest.raises(ValueError, match="need at least 10"):
         bridge_module._parse_incoming_chunk(_manager_fields(0, WINDOW - 1))
@@ -303,6 +443,131 @@ def test_policy_holds_last_complete_window_after_disconnect(monkeypatch):
     policy.inference_step(*_observation())
     assert policy.last_status == "stale_hold"
     assert int(policy._backend.inputs[-1][0, 0]) == 4
+
+
+def test_zerolab_freshness_uses_real_udp_timestamp_not_zmq_arrival(
+    monkeypatch,
+):
+    clock_ns = [2_000_000_000]
+    monkeypatch.setattr(policy_module.time, "monotonic_ns", lambda: clock_ns[0])
+    policy = _make_policy(monkeypatch)
+    fields = _source_fields(0, epoch=77)
+    fields.update(
+        _zerolab_metadata(
+            generation=77,
+            latest_real_ns=1_000_000_000,
+            real_frames=10,
+            ready=True,
+            stale=False,
+        )
+    )
+    policy._merge_source_fields(fields, received_mono=time.monotonic())
+    policy.poll_reference()
+    assert policy.has_fresh_live_reference(0.5) is False
+
+
+def test_interpolated_and_held_chunks_cannot_make_recovery_ready(monkeypatch):
+    policy = _make_policy(monkeypatch)
+    fields = _source_fields(0, epoch=77)
+    fields.update(
+        _zerolab_metadata(
+            generation=77,
+            real_frames=9,
+            ready=False,
+            playout_kind=PlayoutKind.HELD,
+        )
+    )
+    policy._merge_source_fields(fields, time.monotonic())
+    assert policy.live_reference_recovery_ready(10) is False
+
+
+def test_ten_real_fresh_frames_make_recovery_ready(monkeypatch):
+    policy = _make_policy(monkeypatch)
+    fields = _source_fields(0, epoch=77)
+    fields.update(_zerolab_metadata(generation=77, real_frames=10, ready=True))
+    policy._merge_source_fields(fields, time.monotonic())
+    assert policy.live_reference_recovery_ready(10) is True
+
+
+def test_policy_rejects_delayed_message_from_previously_seen_generation(
+    monkeypatch,
+):
+    policy = _make_policy(monkeypatch)
+    assert policy._merge_source_fields(
+        _zerolab_source_fields(0, generation=11), 1.0
+    )
+    assert policy._merge_source_fields(
+        _zerolab_source_fields(10, generation=22), 2.0
+    )
+    assert (
+        policy._merge_source_fields(
+            _zerolab_source_fields(20, generation=11), 3.0
+        )
+        is False
+    )
+    assert policy.source_generation == 22
+
+
+def test_policy_reset_clears_zerolab_generation_tracking(monkeypatch):
+    policy = _make_policy(monkeypatch)
+    assert policy._merge_source_fields(
+        _zerolab_source_fields(0, generation=11), 1.0
+    )
+
+    policy.reset()
+
+    assert policy.source_generation is None
+    assert policy._merge_source_fields(
+        _zerolab_source_fields(20, generation=11), 3.0
+    )
+
+
+def test_policy_hold_keeps_reference_but_continues_inference(monkeypatch):
+    policy = _make_policy(monkeypatch)
+    now = time.monotonic()
+    policy._merge_source_fields(_source_fields(0), now)
+    policy.inference_step(*_observation())
+    held_term = policy._backend.inputs[-1][0, 0]
+    calls = len(policy._backend.inputs)
+
+    assert policy.hold_live_reference() is True
+    policy._merge_source_fields(_source_fields(100), now + 0.1)
+    policy.inference_step(*_observation())
+
+    assert len(policy._backend.inputs) == calls + 1
+    assert policy._backend.inputs[-1][0, 0] == held_term
+    assert policy.has_fresh_live_reference(0.5)
+    assert policy.last_status == "held_reference"
+
+
+def test_policy_rearm_exposes_interpolated_reference(monkeypatch):
+    policy = _make_policy(monkeypatch)
+    now = time.monotonic()
+    policy._merge_source_fields(_source_fields(0), now)
+    policy.inference_step(*_observation())
+    policy.hold_live_reference()
+    policy._merge_source_fields(_source_fields(10, epoch=2), now + 0.1)
+    assert policy.begin_live_reference_rearm() is True
+    policy.set_live_reference_rearm_progress(0.5)
+
+    policy.inference_step(*_observation())
+
+    assert policy._backend.inputs[-1][0, 0] == pytest.approx(5.0)
+    assert policy.last_status == "rearming_reference"
+    policy.complete_live_reference_rearm()
+    assert policy._live_reference_gate.mode.name == "LIVE"
+
+
+def test_policy_reset_returns_reference_gate_to_live(monkeypatch):
+    policy = _make_policy(monkeypatch)
+    policy._merge_source_fields(_source_fields(0), time.monotonic())
+    policy.inference_step(*_observation())
+    assert policy.hold_live_reference() is True
+    assert policy._live_reference_gate.mode.name == "HOLD"
+
+    policy.reset()
+
+    assert policy._live_reference_gate.mode.name == "LIVE"
 
 
 def test_backend_failure_does_not_advance_policy_cursor(monkeypatch):

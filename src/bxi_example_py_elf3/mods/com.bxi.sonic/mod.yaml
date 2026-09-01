@@ -171,10 +171,79 @@ nodes:
         - package: std_msgs
       system: []
 
+  zerolab_source:
+    runtime: python
+    entrypoint: zerolab.source_node:create_node
+    execution: process
+    runtime_profile: host_ros
+    lifecycle: state
+    states: [sonic_zerolab]
+    params:
+      udp_bind_host: 0.0.0.0
+      udp_port: 18000
+      allowed_sender: 192.168.89.171
+      pose_host: 127.0.0.1
+      pose_port: 5558
+      pose_topic: pose
+      rate_hz: 50.0
+      window_frames: 10
+      stale_seconds: 0.5
+      jitter_buffer_seconds: 0.04
+      short_recovery_blend_seconds: 0.2
+      recovery_real_frames: 10
+      record_path: ""
+    manifest:
+      label: ZeroLab姿态源
+    runtime_requirements:
+      python:
+        - import: numpy
+        - import: scipy
+        - import: zmq
+      ros:
+        - package: rclpy
+      system: []
+    shutdown:
+      signal: SIGINT
+      terminate_after: 3.0
+      kill_after: 5.0
+
+  zerolab_bridge:
+    runtime: python
+    entrypoint: pico.pose_to_smpl_ref_bridge:create_node
+    execution: in_process
+    runtime_profile: host_ros
+    lifecycle: state
+    states: [sonic_zerolab]
+    depends_on: [zerolab_source]
+    params:
+      pico_host: 127.0.0.1
+      pico_port: 5558
+      pico_topic: pose
+      out_host: 127.0.0.1
+      out_port: 5557
+      out_topic: smpl_ref
+      rate_hz: 50.0
+      stale_warning_seconds: 0.5
+    manifest:
+      label: ZeroLab SMPL参考桥
+    runtime_requirements:
+      python:
+        - import: zmq
+      ros:
+        - package: rclpy
+        - package: std_msgs
+      system: []
+
 events:
   activate:
     slot: btn_10
     value: 9
+  activate_zerolab:
+    slot: btn_10
+    value: 11
+  arm_zerolab:
+    slot: btn_10
+    value: 12
   reset_alignment:
     slot: btn_9
     value: 1
@@ -227,6 +296,30 @@ states:
       gripper_maximum_mos_temperature_c: 120
       gripper_maximum_motor_temperature_c: 120
 
+  sonic_zerolab:
+    manifest:
+      label: SONIC ZeroLab遥操
+      priority: 839
+      group: Advanced
+      icon: accessibility_new
+      confirm: true
+      confirm_message: >-
+        请先在ZeroLab厂家软件完成N-pose标定并回到中立姿势；进入后等待ZeroLab stream ready
+    params:
+      operator_prompt: >-
+        机器人保持实时Normal直到stream ready；确认操作者处于中立姿势后，由安全员发送btn_10=12接管；再次发送可暂停并回到WAIT_ARM
+      arm_blend_seconds: 2.0
+      auto_rearm_on_recovery: true
+      auto_rearm_blend_seconds: 2.0
+      recovery_real_frames: 10
+      require_live_reference: false
+      yaw_bias_rad: 1.57079632679
+      live_reference_timeout_s: 0.5
+      idle_frame_start: 3509
+      source_blend_seconds: 0.4
+      head_control_enabled: false
+      hardware_gripper: false
+
 routes:
   - from: com.bxi.basic_actions/normal
     event: activate
@@ -246,6 +339,24 @@ routes:
     event: com.bxi.basic_actions/recover
     to: com.bxi.basic_actions/recover
     transition: soft_switch
+  - from: com.bxi.basic_actions/normal
+    event: activate_zerolab
+    to: sonic_zerolab
+    transition: soft_switch
+  - from: sonic_zerolab
+    event: com.bxi.basic_actions/normal
+    to: com.bxi.basic_actions/normal
+    transition: soft_switch
+  - from: sonic_zerolab
+    event: com.bxi.basic_actions/zero_torque
+    to: com.bxi.basic_actions/zero_torque
+  - from: sonic_zerolab
+    event: com.bxi.basic_actions/pd_brake
+    to: com.bxi.basic_actions/pd_brake
+  - from: sonic_zerolab
+    event: com.bxi.basic_actions/recover
+    to: com.bxi.basic_actions/recover
+    transition: soft_switch
 
 actions:
   - from: sonic_teleop
@@ -254,3 +365,9 @@ actions:
     manifest:
       label: 重置朝向对齐
       ui: refresh
+  - from: sonic_zerolab
+    event: arm_zerolab
+    action: arm_zerolab
+    manifest:
+      label: ZeroLab ARM / 暂停
+      ui: shield

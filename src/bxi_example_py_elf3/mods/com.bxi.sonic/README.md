@@ -532,3 +532,209 @@ reference；PICO 同时按住 `A+B+X+Y` 请求校准后平滑切到 live referen
 reference 时进入。因为可用性检查发生在 state-scoped 节点 prepare 之前，首次进入时
 需要把 `pico_manager` 和 `smpl_bridge` 都改成 `lifecycle: mod`，让 PICO 数据流在状态
 切换请求之前已经运行。
+
+## ZeroLab 实时遥操（ELF3 无线适配）
+
+当前无线分支的唯一活动路由为：MotionCaptureMaster 关闭镜像；Windows sender
+`192.168.89.171` 以 50 Hz、每包 992 字节向机器人无线地址
+`192.168.88.172:18000` 发送 UDP。直接网线版本仍保留在提交 `a82e5f4`，其 Windows
+sender 为 `192.168.1.52`、机器人 receiver 为 `192.168.1.51:18000`。无线分支和
+`a82e5f4` 必须使用各自单独的工作树及 build/install；不要把一个版本的 sender、配置或
+构建产物用于另一路由，也不要同时启用两条路由。
+
+开始前必须在
+ZeroLab 厂家软件完成 N-pose 标定并回到中立姿势；UDP 的 world quaternion 已是厂家
+标定后的数据。应用不执行运行时 T-pose、静止姿势或其他人体重标定。ZeroLab 状态使用
+`btn_10=11`，不会启动 PICO manager、RoboticsService、RTSP 或夹爪/头部控制；PICO
+的独立提示和行为保持不变。
+
+不要同时运行 `zerolab.record_cli`、UDP 录制回放、独立 `zerolab_source` 或独立 bridge；
+它们会竞争 18000、5558 或 5557 端口。
+
+终端1启动当前工作树及其万能测试场 MuJoCo：
+
+```bash
+cd /home/fazepurple/ros2_ws/bxi_rl_controller_ros2_example_dev/.worktrees/konodoki-dev
+source /opt/ros/humble/setup.bash
+source /home/fazepurple/ros2_ws/bxi_ros2_pkg/setup.bash
+source install-live-normal/setup.bash
+test "$(ros2 pkg prefix bxi_example_py_elf3)" = "$PWD/install-live-normal"
+export ROS_DOMAIN_ID=42
+ros2 launch bxi_example_py_elf3 example_demo.launch.py
+```
+
+终端2只做状态控制：
+
+```bash
+cd /home/fazepurple/ros2_ws/bxi_rl_controller_ros2_example_dev/.worktrees/konodoki-dev
+source /opt/ros/humble/setup.bash
+source /home/fazepurple/ros2_ws/bxi_ros2_pkg/setup.bash
+source install-live-normal/setup.bash
+test "$(ros2 pkg prefix bxi_example_py_elf3)" = "$PWD/install-live-normal"
+export ROS_DOMAIN_ID=42
+```
+
+先进入 PD brake，再进入 normal，并等待机器人以 idle policy 稳定站立：
+
+```bash
+ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{}'
+ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{btn_3: 1}'
+ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{}'
+sleep 3
+```
+
+```bash
+ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{btn_1: 1}'
+ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{}'
+sleep 5
+```
+
+进入 ZeroLab；此时机器人由持续更新的零速度 Normal policy 平衡，不会立即接管人体目标：
+
+```bash
+ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{btn_10: 11}'
+ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{}'
+sleep 1
+```
+
+```text
+vendor N-pose -> operator neutral -> btn_10=11 -> WAIT_STREAM
+-> WAIT_ARM -> initial btn_10=12 -> 2 s BLENDING -> ARMED
+
+ARMED/BLENDING/HOLD_REFERENCE/REARMING -> btn_10=12
+-> 2 s DISARMING -> live Normal -> WAIT_ARM (fresh) or WAIT_STREAM (stale)
+
+gap <= 0.5 s: 40 ms buffered playout -> held reference if needed
+-> automatic 0.2 s short recovery -> remains ARMED
+
+gap > 0.5 s: HOLD_REFERENCE -> 10 new real valid UDP packets
+-> automatic 2 s REARMING -> ARMED
+```
+
+ `btn_10=11` 后，ZeroLab source/bridge 与 SONIC policy 在后台运行。source 连续收到
+ 严格的 10 帧完整数据后才进入 `WAIT_ARM`；在 `WAIT_STREAM` 和 `WAIT_ARM` 中，电机输出
+ 由零速度 Normal policy 每周期实时更新，而不是重复一张 Normal 快照。初次 ARM 时，系统
+需要一次显式 `btn_10=12`，在 2.0 秒内将实时 Normal 与实时 SONIC 输出混合，之后才进入
+`ARMED`。新鲜度边界是严格的 `> 0.5 s`：最后一个真实有效 UDP 包的接收年龄等于
+`0.5 s` 时不 stale，只有超过 `0.5 s` 才切换 generation 并进入 stale。若初次
+`BLENDING` 中发生 stale，系统取消初次 ARM、重置为 `WAIT_STREAM`，并立即回到实时零速度
+Normal 输出；新 generation 重新满足 10 个真实有效包后只回到 `WAIT_ARM`，不能由旧数据
+或合成帧直接接管。安全员必须重新确认中立姿势并再次发送初次 ARM；只有初次 blend 成功到达
+`ARMED` 后，后续 dropout 恢复才无需第二次 ARM。
+
+需要暂停人体接管而继续保持 ZeroLab 链路时，再发送一次 `btn_10=12`。系统从当前实际应用的
+SONIC 电机目标出发，在 2.0 秒内平滑过渡到持续更新的零速度 Normal policy；输入仍通过
+source、5558 和 5557 更新，但不会控制机器人。数据仍新鲜时完成于 `WAIT_ARM`，数据已 stale
+时完成于 `WAIT_STREAM`。操作者调整并回到中立姿势、日志再次显示 `WAIT_ARM` 后，再发送
+`btn_10=12` 即可重新执行 2.0 秒 Normal 到 SONIC 接管，无需重新发送 `btn_10=11`。
+
+`ARMED` 中的 40 ms jitter buffer 在 50 Hz playout 时钟上做真实帧或插值输出；短缺包时
+可暂时保持最后 reference。未越过 stale 边界而恢复真实输入时，系统自动执行 0.2 秒
+reference-space 短恢复并保持 `ARMED`。插值、保持和短恢复输出都不是网络新鲜度证据；只有
+真实有效 UDP 包会更新 `latest_real_receive_timestamp_ns`、增加新 generation 的
+`real_valid_frames_in_generation` 并证明网络恢复。
+
+等待终端1显示 source、bridge 已就绪并进入 `WAIT_ARM`：
+
+```text
+ZeroLab stream ready; frame=...
+PICO source chunks ready; sent=...
+ZeroLab ARM phase: WAIT_ARM
+```
+
+兼容旧 wire 协议的 `calibration_ready` 仅表示完整 source window 已到达；它不是新的操作者
+标定步骤。以上日志出现后，操作者保持准备接管的中立姿态。系统没有自动的人体姿态安全门，
+安全员必须自行确认目标姿态正确。
+
+安全员先准备好下面相邻的 PD brake 命令，确认操作者保持中立姿态后，再发送 ARM：
+
+```bash
+ros2 topic pub --once /motion_commands \
+  communication/msg/MotionCommands '{btn_10: 12}'
+ros2 topic pub --once /motion_commands \
+  communication/msg/MotionCommands '{}'
+```
+
+动作异常时立即进入 PD brake：
+
+```bash
+ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{btn_3: 1}'
+ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{}'
+```
+
+ARM 后的 2.0 秒交接期间继续保持中立姿态。两秒 blend 可以减小指令跳变，但不能纠正错误的
+目标姿态。`ARMED` 中真实输入年龄严格超过 0.5 s 会进入 `HOLD_REFERENCE`：
+系统保持已接受的人体 reference，继续使用 SONIC 与当前本体感知闭环平衡，并非冻结最后一张
+电机命令。此时必须收到同一新 generation 的 10 个真实有效 UDP 包；随后系统无需第二次
+ARM 按键，自动在 reference space 内执行 2.0 秒 `REARMING` 并回到 `ARMED`。默认
+`auto_rearm_on_recovery: true` 时，初次 ARM 之后再发送 `btn_10=12` 不会重启
+`HOLD_REFERENCE`、`REARMING` 或 `ARMED` 阶段，而是取消当前人体接管并进入
+`DISARMING`。紧急情况不要等待此平滑阶段，应直接进入 PD brake。
+
+自动恢复没有人体 pose-difference gate，也不会验证操作者恢复后的姿势是否接近断流前姿势。
+如果 sender 长时间断开，操作者必须先主动回到中立姿势，再有意恢复 sender。没有支撑架、可用
+急停和独立安全观察员时，禁止在硬件上使用这种无条件自动恢复；blend 不能代替上述安全条件，
+系统也不会因 dropout 自动进入 PD brake。
+
+每次 source 状态变化时以及每 5 秒会打印精确格式的统计行：
+
+```text
+ZeroLab source stats; real_valid_packets=... maximum_real_arrival_gap_ms=... stale_events=... interpolated_output_frames=... held_output_frames=... dropped_backlog_frames=... timeline_redistributed_packets=... maximum_timeline_adjustment_ms=... invalid_packets=... dropped_publications=...
+```
+
+其中 `real_valid_packets` 只累计转换并进入 resampler 的真实包；
+`maximum_real_arrival_gap_ms` 是本次 source 生命周期观察到的最大真实接收间隔；每次跨越严格
+stale 边界时 `stale_events` 加一；三个 playout 计数分别记录插值输出、保持输出和丢弃的积压
+输入帧。当前 wire 协议没有 sender timestamp/sequence，因此 source 会把同一次 drain 中聚集的
+有效包以 50 Hz 从最新真实到达时刻向后展开；这条重建时间轴只供 resampler 使用，不替换 stale、
+source age、录包和网络统计中的真实接收时间。`timeline_redistributed_packets` 是被展开包的累计数，
+`maximum_timeline_adjustment_ms` 是单包时间轴调整的生命周期最大值；二者只能诊断机器人接收端
+聚包，不能恢复 sender 端丢包或证明真实采样时刻。`invalid_packets` 只记录通过 receiver 后解析失败的包，不包含 receiver 在 992 字节
+长度或 sender IP 过滤处拒绝的 datagram；`dropped_publications` 记录 ZMQ 非阻塞发送失败。
+状态侧每次成功开始自动 rearm 后将会话内 `auto_rearm_count` 加一（重新 prepare/exit 会清零），
+它不包含在上面的 source 统计行中。关键状态日志为：
+
+```text
+ZeroLab input stale; holding playout with source_stale=1
+ZeroLab reference stale; holding human reference while SONIC balance continues
+ZeroLab automatic recovery; ARM phase: REARMING for 2.000 s
+ZeroLab automatic recovery complete; ARM phase: ARMED
+```
+
+已知 wire 协议限制：datagram 必须正好 992 字节，payload 本身没有 sender sequence、sender
+timestamp、版本、校验和、认证、加密或重传；frame index 和真实 receive timestamp 都由 receiver
+按本机接收顺序生成，因此不能从 wire metadata 识别上游乱序或丢包。上述重建 sample timestamp
+只是 50 Hz fallback，不等价于 sender capture timestamp。`allowed_sender` 只过滤源
+IP，不认证源端口或发送者身份。UDP receiver 每个 20 ms tick 会分批读取并反复 drain，直到
+socket 明确耗尽后才 sample，因此有限 backlog 会先全部排空；如果无限持续 ingress 的速度使
+socket 永远不耗尽，timer/sample 可能饥饿。这是本配置接受的限制，sender 必须保持 50 Hz，
+不得用持续 flood 做运行模式。
+
+MuJoCo acceptance 必须覆盖 0.10 s、0.49 s、0.51 s、2.0 s 和 30.0 s 的 dropout：确认
+`WAIT_STREAM`/`WAIT_ARM` 持续实时 Normal、初次 2.0 秒 blend、短 gap 保持 `ARMED`，以及
+长 gap 的 10 个真实包门槛与自动 2.0 秒 rearm。硬件仍然禁止，直至这些 MuJoCo acceptance
+项全部通过，并且独立确认 CAN 与 `motor_timeout` clearance；通过其中一项不解除另一项硬件阻断。
+
+检查状态和三个监听端口：
+
+```bash
+ros2 topic echo --no-daemon --once --full-length --field data /simulation/state_machine_info std_msgs/msg/String
+ss -H -lunp 'sport = :18000'
+ss -H -ltnp 'sport = :5558'
+ss -H -ltnp 'sport = :5557'
+```
+
+正常退出并释放端口：
+
+```bash
+ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{btn_1: 1}'
+ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{}'
+sleep 3
+```
+
+仅在操作者明确需要完全卸力时使用 zero torque：
+
+```bash
+ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{btn_2: 1}'
+ros2 topic pub --once /motion_commands communication/msg/MotionCommands '{}'
+```

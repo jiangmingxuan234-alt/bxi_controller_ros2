@@ -1,0 +1,250 @@
+#!/bin/bash
+set -eu
+
+ACTION=${1:-}
+IP_BIN=${ZEROLAB_IP_BIN:-/usr/sbin/ip}
+SYSCTL_BIN=${ZEROLAB_SYSCTL_BIN:-/usr/sbin/sysctl}
+SYSTEMD_NOTIFY_BIN=${ZEROLAB_SYSTEMD_NOTIFY_BIN:-/usr/bin/systemd-notify}
+STATE_DIR=${ZEROLAB_NETWORK_STATE_DIR:-/run/zerolab-network}
+ETH=${ZEROLAB_ETH:-enp86s0}
+WIFI=${ZEROLAB_WIFI:-wlo1}
+RECONCILE_SECONDS=${ZEROLAB_RECONCILE_SECONDS:-1}
+ADDRESS=192.168.88.213/32
+ARP_KEY="net.ipv4.conf.$WIFI.arp_ignore"
+
+case "$STATE_DIR" in
+  /run/* | /tmp/*) ;;
+  *)
+    echo "invalid ZeroLab network state directory: $STATE_DIR" >&2
+    exit 2
+    ;;
+esac
+
+address_present()
+{
+  "$IP_BIN" -4 address show dev "$ETH" |
+    grep -Fq "inet $ADDRESS "
+}
+
+valid_reconcile_seconds()
+{
+  printf '%s\n' "$RECONCILE_SECONDS" |
+    grep -Eq '^[0-9]+([.][0-9]+)?$' &&
+    awk -v value="$RECONCILE_SECONDS" \
+      'BEGIN { exit !(value > 0) }'
+}
+
+stop_network()
+{
+  STOP_RC=0
+  rm -f "$STATE_DIR/active" || STOP_RC=1
+
+  if [ -f "$STATE_DIR/arp_ignore.old" ]; then
+    OLD_ARP_IGNORE=
+    if IFS= read -r OLD_ARP_IGNORE < "$STATE_DIR/arp_ignore.old" &&
+      [ -n "$OLD_ARP_IGNORE" ] &&
+      ! printf '%s' "$OLD_ARP_IGNORE" | grep -q '[^0-9]'
+    then
+      if "$SYSCTL_BIN" -w "$ARP_KEY=$OLD_ARP_IGNORE"
+      then
+        rm -f "$STATE_DIR/arp_ignore.old"
+      else
+        STOP_RC=1
+      fi
+    else
+      echo "invalid saved arp_ignore value" >&2
+      STOP_RC=1
+    fi
+  fi
+
+  if [ -f "$STATE_DIR/address.added" ]; then
+    if ! address_present
+    then
+      rm -f "$STATE_DIR/address.added"
+    elif "$IP_BIN" address delete "$ADDRESS" dev "$ETH"
+    then
+      rm -f "$STATE_DIR/address.added"
+    else
+      STOP_RC=1
+    fi
+  fi
+
+  if [ -f "$STATE_DIR/address.preexisting" ]; then
+    if address_present
+    then
+      rm -f "$STATE_DIR/address.preexisting"
+    elif "$IP_BIN" address add "$ADDRESS" dev "$ETH"
+    then
+      rm -f "$STATE_DIR/address.preexisting"
+    else
+      STOP_RC=1
+    fi
+  fi
+
+  rmdir "$STATE_DIR" 2>/dev/null || true
+  return "$STOP_RC"
+}
+
+start_network()
+{
+  if [ -f "$STATE_DIR/active" ]; then
+    return 0
+  fi
+  if [ -d "$STATE_DIR" ]; then
+    if ! stop_network; then
+      echo "previous ZeroLab network cleanup is incomplete" >&2
+      return 1
+    fi
+  fi
+
+  umask 077
+  mkdir -p "$STATE_DIR"
+
+  if ! OLD_ARP_IGNORE=$("$SYSCTL_BIN" -n "$ARP_KEY")
+  then
+    echo "failed to snapshot $ARP_KEY" >&2
+    rmdir "$STATE_DIR" 2>/dev/null || true
+    return 1
+  fi
+  if [ -z "$OLD_ARP_IGNORE" ] ||
+    printf '%s' "$OLD_ARP_IGNORE" | grep -q '[^0-9]'
+  then
+    echo "invalid current $ARP_KEY value" >&2
+    rmdir "$STATE_DIR" 2>/dev/null || true
+    return 1
+  fi
+  if ! printf '%s\n' "$OLD_ARP_IGNORE" > "$STATE_DIR/arp_ignore.old"
+  then
+    rmdir "$STATE_DIR" 2>/dev/null || true
+    return 1
+  fi
+
+  if address_present
+  then
+    if ! : > "$STATE_DIR/address.preexisting"
+    then
+      stop_network || true
+      return 1
+    fi
+  else
+    if ! "$IP_BIN" address add "$ADDRESS" dev "$ETH"
+    then
+      echo "failed to add $ADDRESS to $ETH" >&2
+      stop_network || true
+      return 1
+    fi
+    if ! : > "$STATE_DIR/address.added"
+    then
+      "$IP_BIN" address delete "$ADDRESS" dev "$ETH" || true
+      stop_network || true
+      return 1
+    fi
+  fi
+
+  if ! "$SYSCTL_BIN" -w "$ARP_KEY=1"
+  then
+    stop_network || true
+    return 1
+  fi
+  if ! : > "$STATE_DIR/active"
+  then
+    stop_network || true
+    return 1
+  fi
+}
+
+reconcile_network()
+{
+  RECONCILE_RC=0
+
+  if ! address_present
+  then
+    if "$IP_BIN" address add "$ADDRESS" dev "$ETH"
+    then
+      echo "restored ZeroLab receive address $ADDRESS on $ETH"
+    else
+      echo "failed to restore ZeroLab receive address" >&2
+      RECONCILE_RC=1
+    fi
+  fi
+
+  CURRENT_ARP_IGNORE=
+  if ! CURRENT_ARP_IGNORE=$("$SYSCTL_BIN" -n "$ARP_KEY")
+  then
+    echo "failed to read $ARP_KEY" >&2
+    RECONCILE_RC=1
+  elif [ "$CURRENT_ARP_IGNORE" != 1 ]; then
+    if "$SYSCTL_BIN" -w "$ARP_KEY=1"
+    then
+      echo "restored $ARP_KEY=1"
+    else
+      echo "failed to restore $ARP_KEY=1" >&2
+      RECONCILE_RC=1
+    fi
+  fi
+
+  return "$RECONCILE_RC"
+}
+
+cleanup_run()
+{
+  RUN_RC=$?
+  trap - EXIT
+  if ! stop_network; then
+    RUN_RC=1
+  fi
+  exit "$RUN_RC"
+}
+
+run_network()
+{
+  if ! valid_reconcile_seconds
+  then
+    echo "invalid ZeroLab reconciliation interval: $RECONCILE_SECONDS" >&2
+    return 2
+  fi
+
+  trap cleanup_run EXIT
+  trap 'exit 1' HUP
+  trap 'exit 0' INT TERM
+
+  if [ -d "$STATE_DIR" ] && ! stop_network
+  then
+    echo "previous ZeroLab network cleanup is incomplete" >&2
+    return 1
+  fi
+  if ! start_network
+  then
+    return 1
+  fi
+  if ! "$SYSTEMD_NOTIFY_BIN" --ready
+  then
+    echo "failed to notify systemd readiness" >&2
+    return 1
+  fi
+
+  while :
+  do
+    sleep "$RECONCILE_SECONDS"
+    if ! reconcile_network
+    then
+      echo "ZeroLab network reconciliation failed; retrying" >&2
+    fi
+  done
+}
+
+case "$ACTION" in
+  start)
+    start_network
+    ;;
+  stop)
+    stop_network
+    ;;
+  run)
+    run_network
+    ;;
+  *)
+    echo "usage: $0 {start|stop|run}" >&2
+    exit 2
+    ;;
+esac

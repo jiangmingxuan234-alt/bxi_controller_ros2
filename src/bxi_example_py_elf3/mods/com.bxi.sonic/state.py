@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import time
 from threading import Lock
-from typing import TYPE_CHECKING, Optional, Protocol
+from typing import Any, TYPE_CHECKING, Optional, Protocol
 
 import numpy as np
 import communication.msg as bxi_msg
@@ -41,6 +41,9 @@ if TYPE_CHECKING:
 
 
 HEAD_JOINT_NAMES = ("head_y_joint", "head_z_joint")
+DEFAULT_OPERATOR_PROMPT = (
+    "PICO同时按住A+B+X+Y请求校准，再按A+X切入实时POSE"
+)
 SONIC_HEAD_JOINTS = JointLayout(HEAD_JOINT_NAMES, label="SONIC PICO head command")
 SONIC_OUTPUT_JOINTS = JointLayout(
     (*ELF3_POLICY_JOINTS.names, *SONIC_HEAD_JOINTS.names),
@@ -81,6 +84,24 @@ class SonicPolicy(Protocol):
     def has_fresh_live_reference(self, timeout_s: float | None = None) -> bool:
         ...
 
+    def live_reference_recovery_ready(self, required_real_frames: int) -> bool:
+        ...
+
+    def hold_live_reference(self) -> bool:
+        ...
+
+    def begin_live_reference_rearm(self) -> bool:
+        ...
+
+    def set_live_reference_rearm_progress(self, alpha: float) -> None:
+        ...
+
+    def complete_live_reference_rearm(self) -> None:
+        ...
+
+    def release_live_reference_hold(self) -> None:
+        ...
+
     def reset_yaw_alignment(self) -> None:
         ...
 
@@ -101,11 +122,13 @@ class SonicTeleopState(
         state_id: int,
         policy: ResourceHandle[SonicPolicy],
         *,
+        additional_resources: tuple[ResourceHandle[Any], ...] = (),
         require_live_reference: bool = False,
         yaw_bias_rad: float = math.pi / 2.0,
         live_reference_timeout_s: float = 0.5,
         idle_frame_start: int = 3509,
         source_blend_seconds: float = 0.4,
+        operator_prompt: str = DEFAULT_OPERATOR_PROMPT,
         head_control_enabled: bool = True,
         head_pitch_limit_rad: float = 0.5,
         head_yaw_limit_rad: float = 1.0,
@@ -137,7 +160,11 @@ class SonicTeleopState(
         gripper_maximum_mos_temperature_c: int = 80,
         gripper_maximum_motor_temperature_c: int = 80,
     ) -> None:
-        super().__init__(name, state_id, resources=(policy,))
+        super().__init__(
+            name,
+            state_id,
+            resources=(policy, *additional_resources),
+        )
         if gripper_enable_interval_s <= 0.0:
             raise ValueError("gripper_enable_interval_s must be positive")
         self._policy = policy
@@ -146,6 +173,9 @@ class SonicTeleopState(
         self.live_reference_timeout_s = float(live_reference_timeout_s)
         self.idle_frame_start = int(idle_frame_start)
         self.source_blend_seconds = float(source_blend_seconds)
+        self.operator_prompt = str(operator_prompt)
+        if not self.operator_prompt:
+            raise ValueError("SONIC operator_prompt must not be empty")
         self.head_control_enabled = bool(head_control_enabled)
         self.head_pitch_limit_rad = float(head_pitch_limit_rad)
         self.head_yaw_limit_rad = float(head_yaw_limit_rad)
@@ -433,8 +463,7 @@ class SonicTeleopState(
             else "头部跟踪已关闭"
         )
         self.logger.info(
-            f"{mode}已启动；{head_status}；"
-            "PICO同时按住A+B+X+Y请求校准，再按A+X切入实时POSE"
+            f"{mode}已启动；{head_status}；{self.operator_prompt}"
         )
         if self.hardware_gripper:
             self._left_trigger = self._right_trigger = 0.0

@@ -456,16 +456,21 @@ std::vector<std::string> InputMapper::refresh_bindings(bool emit_edges)
         const bool active = conditions_match(binding);
 
         if (binding.mode == "edge") {
-            if (emit_edges && input_edges_enabled_ && active && !binding_active_[index]) {
+            const bool edge_active = binding.has_edge_when ?
+                condition_matches(binding.edge_when) : active;
+            if (emit_edges && input_edges_enabled_ && active &&
+                edge_active && !binding_active_[index]) {
                 if (!apply_edge_pulse_output(binding.output)) {
                     edge_outputs.push_back(binding.output);
                 }
             }
+            binding_active_[index] = edge_active;
         } else if (active) {
             apply_level_output(binding.output);
+            binding_active_[index] = active;
+        } else {
+            binding_active_[index] = active;
         }
-
-        binding_active_[index] = active;
     }
     log_button_output_changes();
 

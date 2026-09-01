@@ -1,14 +1,20 @@
 [Unit]
-Description=ROS Launch Service
+Description=Elf3 tablet remote controller
+After=zerolab-hardware.service
 
 [Service]
+KillMode=control-group
+KillSignal=SIGINT
+TimeoutStopSec=15s
+SendSIGKILL=yes
 Type=simple
 User=root
-Environment=ROS_DOMAIN_ID=XX
+Environment=ROS_DOMAIN_ID=111
 Environment=RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 Environment=ROS_LOCALHOST_ONLY=0
 Environment='CYCLONEDDS_URI=<CycloneDDS><Domain Id="any"><General><Interfaces><NetworkInterface name="lo" multicast="true"/></Interfaces><AllowMulticast>true</AllowMulticast></General></Domain></CycloneDDS>'
-ExecStart=/bin/bash -lc "source /home/bxi/bxi_ws/bxi_rl_controller_ros2_example/install/setup.bash && exec ros2 launch remote_controller remote_controller.launch.py"
+ExecStartPre=/usr/bin/test -f /home/bxi/zerolab-wireless-auto-recovery-20260824/install-wireless-auto-recovery/setup.bash
+ExecStart=/bin/bash -lc "source /opt/ros/humble/setup.bash && source /opt/bxi/bxi_ros2_pkg/setup.bash && source /home/bxi/bxi_ws/bxi_rl_controller_ros2_example/install/setup.bash && source /home/bxi/zerolab-wireless-auto-recovery-20260824/install-wireless-auto-recovery/setup.bash && exec ros2 launch remote_controller remote_controller.launch.py"
 Restart=on-failure
 RestartSec=3
 

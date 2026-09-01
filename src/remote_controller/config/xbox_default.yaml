@@ -329,7 +329,27 @@ outputs:
     - output: system.start
       when: [system.start_event]
 
-  #电平触发，满足条件会一直输出
+    # 单独 A：从 Normal 进入 SONIC ZeroLab；每次按下只发送一个脉冲。
+    - output: btn_10=11
+      edge_when: button.a_event
+      when:
+        - button.a_event
+        - released: shoulder.left_event
+        - released: shoulder.right_event
+        - released: trigger.left_event
+        - released: trigger.right_event
+
+    # 单独 Y：在 SONIC ZeroLab 内 ARM/暂停；每次按下只发送一个脉冲。
+    - output: btn_10=12
+      edge_when: button.y_event
+      when:
+        - button.y_event
+        - released: shoulder.left_event
+        - released: shoulder.right_event
+        - released: trigger.left_event
+        - released: trigger.right_event
+
+    #电平触发，满足条件会一直输出
   level:
     # RB+X（键盘 1）：普通站立/行走 normal。
     - output: btn_1=1
@@ -541,24 +561,6 @@ outputs:
     # 预留组合：四个辅助键 LB/RB/LT/RT 的全部状态 × A/B/X/Y。
     # 已有映射保持 btn_1..btn_9 和 btn_10=1..10 不变；缺失组合使用 btn_10=11..54。
     # 约定：LB=shoulder.left，RB=shoulder.right，LT=trigger.left，RT=trigger.right。
-
-    # A
-    - output: btn_10=11
-      when:
-        - button.a_event
-        - released: shoulder.left_event
-        - released: shoulder.right_event
-        - released: trigger.left_event
-        - released: trigger.right_event
-
-    # Y
-    - output: btn_10=12
-      when:
-        - button.y_event
-        - released: shoulder.left_event
-        - released: shoulder.right_event
-        - released: trigger.left_event
-        - released: trigger.right_event
 
     # LB+RB+A
     - output: btn_10=13
@@ -943,13 +945,11 @@ outputs:
 system:
   start:
     - "mkdir -p /var/log/bxi_log"
-    - "ros2 launch bxi_example_py_elf3 example_demo_hw.launch.py > /var/log/bxi_log/$(date +%Y-%m-%d_%H-%M-%S)_elf.log 2>&1 &"
+    - "systemctl start zerolab-hardware.service"
     - "ros2 launch bxi_example_bms bms.launch.py > /var/log/bxi_log/bms_$(date +%Y-%m-%d_%H-%M-%S)_bms.log 2>&1 &"
     - "su bxi -c \"cd /home/bxi/bxi_ws/bxi_voice && ./bin/bxi-voice\" 2>&1 &"
   stop:
-    - "killall -SIGINT hardware_elf3"
-    - "killall -SIGINT bxi_example_py_elf3"
-    - "killall -SIGINT bxi_example_py_elf3_demo"
+    - "systemctl stop zerolab-hardware.service"
     - "pkill -SIGINT -f '[/]bxi_depth_camera/cameras|[b]xi_depth_camera\\.manager'"
     - "killall -SIGINT bxi_bms"
     - "killall -SIGINT bxi_example_bms"
