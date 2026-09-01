@@ -21,21 +21,35 @@ esac
 stop_network()
 {
   STOP_RC=0
+  rm -f "$STATE_DIR/active" || STOP_RC=1
 
   if [ -f "$STATE_DIR/arp_ignore.old" ]; then
-    IFS= read -r OLD_ARP_IGNORE < "$STATE_DIR/arp_ignore.old" ||
-      OLD_ARP_IGNORE=0
-    "$SYSCTL_BIN" -w "$ARP_KEY=$OLD_ARP_IGNORE" || STOP_RC=1
+    OLD_ARP_IGNORE=
+    if IFS= read -r OLD_ARP_IGNORE < "$STATE_DIR/arp_ignore.old" &&
+      [ -n "$OLD_ARP_IGNORE" ] &&
+      ! printf '%s' "$OLD_ARP_IGNORE" | grep -q '[^0-9]'
+    then
+      if "$SYSCTL_BIN" -w "$ARP_KEY=$OLD_ARP_IGNORE"
+      then
+        rm -f "$STATE_DIR/arp_ignore.old"
+      else
+        STOP_RC=1
+      fi
+    else
+      echo "invalid saved arp_ignore value" >&2
+      STOP_RC=1
+    fi
   fi
 
   if [ -f "$STATE_DIR/address.added" ]; then
-    "$IP_BIN" address delete "$ADDRESS" dev "$ETH" || STOP_RC=1
+    if "$IP_BIN" address delete "$ADDRESS" dev "$ETH"
+    then
+      rm -f "$STATE_DIR/address.added"
+    else
+      STOP_RC=1
+    fi
   fi
 
-  rm -f \
-    "$STATE_DIR/active" \
-    "$STATE_DIR/address.added" \
-    "$STATE_DIR/arp_ignore.old"
   rmdir "$STATE_DIR" 2>/dev/null || true
   return "$STOP_RC"
 }
@@ -46,12 +60,14 @@ case "$ACTION" in
       exit 0
     fi
     if [ -d "$STATE_DIR" ]; then
-      stop_network
+      if ! stop_network; then
+        echo "previous ZeroLab network cleanup is incomplete" >&2
+        exit 1
+      fi
     fi
 
     umask 077
     mkdir -p "$STATE_DIR"
-    "$SYSCTL_BIN" -n "$ARP_KEY" > "$STATE_DIR/arp_ignore.old"
 
     START_COMMITTED=0
     rollback_on_exit()
@@ -66,11 +82,32 @@ case "$ACTION" in
     trap rollback_on_exit EXIT
     trap 'exit 1' HUP INT TERM
 
+    if ! OLD_ARP_IGNORE=$("$SYSCTL_BIN" -n "$ARP_KEY")
+    then
+      echo "failed to snapshot $ARP_KEY" >&2
+      exit 1
+    fi
+    if [ -z "$OLD_ARP_IGNORE" ] ||
+      printf '%s' "$OLD_ARP_IGNORE" | grep -q '[^0-9]'
+    then
+      echo "invalid current $ARP_KEY value" >&2
+      exit 1
+    fi
+    printf '%s\n' "$OLD_ARP_IGNORE" > "$STATE_DIR/arp_ignore.old"
+
     if ! "$IP_BIN" -4 address show dev "$ETH" |
       grep -Fq "inet $ADDRESS "
     then
-      : > "$STATE_DIR/address.added"
-      "$IP_BIN" address add "$ADDRESS" dev "$ETH"
+      if ! "$IP_BIN" address add "$ADDRESS" dev "$ETH"
+      then
+        echo "failed to add $ADDRESS to $ETH" >&2
+        exit 1
+      fi
+      if ! : > "$STATE_DIR/address.added"
+      then
+        "$IP_BIN" address delete "$ADDRESS" dev "$ETH" || true
+        exit 1
+      fi
     fi
 
     "$SYSCTL_BIN" -w "$ARP_KEY=1"

@@ -45,6 +45,7 @@ CAND=/home/bxi/zerolab-wireless-auto-recovery-20260824
 
 sudo systemctl stop ros_elf_launch.service
 sudo systemctl stop zerolab-hardware.service 2>/dev/null || true
+sudo systemctl stop zerolab-network.service 2>/dev/null || true
 
 if pgrep -af \
   '[h]ardware_elf3|[b]xi_example_py_elf3_demo|[z]erolab_source'

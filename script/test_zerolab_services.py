@@ -85,3 +85,160 @@ esac
         "sysctl -w net.ipv4.conf.wlan-test.arp_ignore=0" in commands
     )
     assert not state_dir.exists()
+
+
+def test_network_helper_leaves_no_state_when_snapshot_fails(tmp_path):
+    log = tmp_path / "commands.log"
+    fake_ip = tmp_path / "ip"
+    fake_sysctl = tmp_path / "sysctl"
+    state_dir = tmp_path / "state"
+    _write_executable(fake_ip, "exit 0\n")
+    _write_executable(
+        fake_sysctl,
+        """printf 'sysctl %s\\n' "$*" >> "$ZEROLAB_TEST_LOG"
+if [ "$1" = "-n" ]; then
+  exit 23
+fi
+exit 0
+""",
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "ZEROLAB_IP_BIN": str(fake_ip),
+            "ZEROLAB_SYSCTL_BIN": str(fake_sysctl),
+            "ZEROLAB_NETWORK_STATE_DIR": str(state_dir),
+            "ZEROLAB_ETH": "enp-test",
+            "ZEROLAB_WIFI": "wlan-test",
+            "ZEROLAB_TEST_LOG": str(log),
+        }
+    )
+
+    result = subprocess.run(
+        [str(NETWORK_HELPER), "start"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert not state_dir.exists()
+
+
+def test_network_helper_does_not_own_address_when_add_fails(tmp_path):
+    log = tmp_path / "commands.log"
+    fake_ip = tmp_path / "ip"
+    fake_sysctl = tmp_path / "sysctl"
+    state_dir = tmp_path / "state"
+    _write_executable(
+        fake_ip,
+        """printf 'ip %s\\n' "$*" >> "$ZEROLAB_TEST_LOG"
+if [ "$1 $2" = "address add" ]; then
+  exit 24
+fi
+exit 0
+""",
+    )
+    _write_executable(
+        fake_sysctl,
+        """printf 'sysctl %s\\n' "$*" >> "$ZEROLAB_TEST_LOG"
+if [ "$1" = "-n" ]; then
+  printf '1\\n'
+fi
+exit 0
+""",
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "ZEROLAB_IP_BIN": str(fake_ip),
+            "ZEROLAB_SYSCTL_BIN": str(fake_sysctl),
+            "ZEROLAB_NETWORK_STATE_DIR": str(state_dir),
+            "ZEROLAB_ETH": "enp-test",
+            "ZEROLAB_WIFI": "wlan-test",
+            "ZEROLAB_TEST_LOG": str(log),
+        }
+    )
+
+    result = subprocess.run(
+        [str(NETWORK_HELPER), "start"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    commands = log.read_text().splitlines()
+    assert "ip address add 192.168.88.213/32 dev enp-test" in commands
+    assert "ip address delete 192.168.88.213/32 dev enp-test" not in commands
+    assert not state_dir.exists()
+
+
+def test_network_helper_retains_failed_cleanup_for_retry(tmp_path):
+    log = tmp_path / "commands.log"
+    delete_failed = tmp_path / "delete-failed"
+    fake_ip = tmp_path / "ip"
+    fake_sysctl = tmp_path / "sysctl"
+    state_dir = tmp_path / "state"
+    _write_executable(
+        fake_ip,
+        """printf 'ip %s\\n' "$*" >> "$ZEROLAB_TEST_LOG"
+if [ "$1 $2" = "address delete" ] && [ ! -f "$ZEROLAB_DELETE_FAILED" ]; then
+  : > "$ZEROLAB_DELETE_FAILED"
+  exit 25
+fi
+exit 0
+""",
+    )
+    _write_executable(
+        fake_sysctl,
+        """printf 'sysctl %s\\n' "$*" >> "$ZEROLAB_TEST_LOG"
+if [ "$1" = "-n" ]; then
+  printf '3\\n'
+fi
+exit 0
+""",
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "ZEROLAB_IP_BIN": str(fake_ip),
+            "ZEROLAB_SYSCTL_BIN": str(fake_sysctl),
+            "ZEROLAB_NETWORK_STATE_DIR": str(state_dir),
+            "ZEROLAB_ETH": "enp-test",
+            "ZEROLAB_WIFI": "wlan-test",
+            "ZEROLAB_TEST_LOG": str(log),
+            "ZEROLAB_DELETE_FAILED": str(delete_failed),
+        }
+    )
+
+    started = subprocess.run(
+        [str(NETWORK_HELPER), "start"], env=env, check=False
+    )
+    first_stop = subprocess.run(
+        [str(NETWORK_HELPER), "stop"], env=env, check=False
+    )
+
+    assert started.returncode == 0
+    assert first_stop.returncode != 0
+    assert (state_dir / "address.added").exists()
+
+    second_stop = subprocess.run(
+        [str(NETWORK_HELPER), "stop"], env=env, check=False
+    )
+
+    assert second_stop.returncode == 0
+    assert not state_dir.exists()
+
+
+def test_upgrade_stops_legacy_network_unit_before_replacing_it():
+    readme = (SCRIPT_DIR / "README-zerolab-services.md").read_text()
+    assert "sudo systemctl stop zerolab-network.service" in readme
+    stop = readme.index("sudo systemctl stop zerolab-network.service")
+    install = readme.index(
+        '"$CAND/script/zerolab-network.service"'
+    )
+
+    assert stop < install
