@@ -75,6 +75,20 @@ def test_timer_jitter_near_50_hz_period_does_not_halve_playout_rate():
     assert [output.frame.frame_index for output in outputs] == list(range(6))
 
 
+def test_timer_catchup_after_long_callback_preserves_playout_phase():
+    resampler = make_resampler()
+    resampler.observe(frame(0, 0, 0.0))
+    timer_offsets_ns = (0, 20_000_000, 49_000_000, 60_000_000, 80_000_000)
+
+    outputs = [
+        resampler.sample(80_000_000 + offset_ns)
+        for offset_ns in timer_offsets_ns
+    ]
+
+    assert all(output is not None for output in outputs)
+    assert [output.frame.frame_index for output in outputs] == list(range(5))
+
+
 def test_jittered_samples_interpolate_continuous_fields():
     resampler = make_resampler()
     resampler.observe(frame(0, 0, 0.0))

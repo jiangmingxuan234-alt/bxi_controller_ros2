@@ -173,13 +173,12 @@ class ZeroLabPoseResampler:
         if isinstance(now_ns, bool) or not isinstance(now_ns, Integral):
             raise ValueError("now_ns must be an integer")
         now_ns = int(now_ns)
-        if self._last_output_now_ns is not None:
-            elapsed_ns = now_ns - self._last_output_now_ns
-            if (
-                elapsed_ns + self._output_early_tolerance_ns
-                < self._output_period_ns
-            ):
-                return None
+        output_slot = self._output_slot(now_ns)
+        if (
+            self._last_output_slot is not None
+            and output_slot <= self._last_output_slot
+        ):
+            return None
         target_ns = now_ns - self._jitter_buffer_ns
         target_frame, target_kind, left = self._select_target(target_ns)
         if left is not None:
@@ -188,7 +187,11 @@ class ZeroLabPoseResampler:
             if self._last_output is None:
                 return None
             return self._emit(
-                self._last_output.frame, PlayoutKind.HELD, target_ns, now_ns
+                self._last_output.frame,
+                PlayoutKind.HELD,
+                target_ns,
+                now_ns,
+                output_slot,
             )
 
         if self._catchup_start is None and self._last_output is not None:
@@ -215,8 +218,10 @@ class ZeroLabPoseResampler:
             if alpha == 1.0:
                 self._catchup_start = None
                 self._catchup_started_ns = None
-            return self._emit(pose, kind, target_ns, now_ns)
-        return self._emit(target_frame, target_kind, target_ns, now_ns)
+            return self._emit(pose, kind, target_ns, now_ns, output_slot)
+        return self._emit(
+            target_frame, target_kind, target_ns, now_ns, output_slot
+        )
 
     def mark_stale(self) -> None:
         """Drop live brackets while retaining the last output as a diagnostic hold."""
@@ -235,8 +240,17 @@ class ZeroLabPoseResampler:
         self._catchup_started_ns = None
         self._suppress_short_recovery = False
         self._next_output_index = 0
-        self._last_output_now_ns = None
+        self._output_epoch_ns = None
+        self._last_output_slot = None
         self._stats = ResamplerStats()
+
+    def _output_slot(self, now_ns):
+        if self._output_epoch_ns is None:
+            return 0
+        elapsed_ns = now_ns - self._output_epoch_ns
+        return (
+            elapsed_ns + self._output_early_tolerance_ns
+        ) // self._output_period_ns
 
     def _select_target(self, target_ns):
         if not self._frames:
@@ -283,7 +297,7 @@ class ZeroLabPoseResampler:
                 dropped_backlog_frames=self._stats.dropped_backlog_frames + discarded,
             )
 
-    def _emit(self, source, kind, target_ns, now_ns):
+    def _emit(self, source, kind, target_ns, now_ns, output_slot):
         frame = ConvertedPoseFrame(
             frame_index=self._next_output_index,
             receive_timestamp_ns=target_ns,
@@ -310,5 +324,7 @@ class ZeroLabPoseResampler:
             latest_real_receive_timestamp_ns=self._latest_real_receive_timestamp_ns,
         )
         self._last_output = output
-        self._last_output_now_ns = now_ns
+        if self._output_epoch_ns is None:
+            self._output_epoch_ns = now_ns
+        self._last_output_slot = output_slot
         return output
