@@ -1,0 +1,18 @@
+[Unit]
+Description=ZeroLab receive network configuration
+Wants=network-online.target
+After=NetworkManager.service network-online.target
+Before=zerolab-hardware.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStartPre=/usr/bin/test -d /sys/class/net/enp86s0
+ExecStartPre=/usr/bin/test -d /sys/class/net/wlo1
+ExecStart=/usr/sbin/ip address replace 192.168.88.213/32 dev enp86s0
+ExecStart=/usr/sbin/sysctl -w net.ipv4.conf.wlo1.arp_ignore=1
+ExecStop=-/usr/sbin/ip address delete 192.168.88.213/32 dev enp86s0
+ExecStop=-/usr/sbin/sysctl -w net.ipv4.conf.wlo1.arp_ignore=0
+
+[Install]
+WantedBy=multi-user.target

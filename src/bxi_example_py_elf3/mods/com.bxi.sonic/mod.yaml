@@ -307,7 +307,7 @@ states:
         请先在ZeroLab厂家软件完成N-pose标定并回到中立姿势；进入后等待ZeroLab stream ready
     params:
       operator_prompt: >-
-        机器人保持实时Normal直到stream ready；确认操作者处于中立姿势后，由安全员发送btn_10=12
+        机器人保持实时Normal直到stream ready；确认操作者处于中立姿势后，由安全员发送btn_10=12接管；再次发送可暂停并回到WAIT_ARM
       arm_blend_seconds: 2.0
       auto_rearm_on_recovery: true
       auto_rearm_blend_seconds: 2.0
@@ -369,5 +369,5 @@ actions:
     event: arm_zerolab
     action: arm_zerolab
     manifest:
-      label: ZeroLab ARM
+      label: ZeroLab ARM / 暂停
       ui: shield

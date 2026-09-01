@@ -745,6 +745,9 @@ class SonicTeleopPolicy(JointPolicy):
     def complete_live_reference_rearm(self) -> None:
         self._live_reference_gate.complete_rearm()
 
+    def release_live_reference_hold(self) -> None:
+        self._live_reference_gate.release_to_live()
+
     def reset_yaw_alignment(self) -> None:
         self.yaw_aligned = False
         self.yaw_offset = 0.0

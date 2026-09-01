@@ -29,6 +29,7 @@ class ZeroLabArmPhase(str, Enum):
     WAIT_ARM = "wait_arm"
     BLENDING = "blending"
     ARMED = "armed"
+    DISARMING = "disarming"
     HOLD_REFERENCE = "hold_reference"
     REARMING = "rearming"
 
@@ -86,6 +87,7 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
         self._applied_frame = None
         self._live_frame = None
         self._normal_frame = None
+        self._disarm_frame = None
         self._blend_elapsed_s = 0.0
         self._initial_arm_completed = False
         self._auto_rearm_count = 0
@@ -155,6 +157,7 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
         self._applied_frame = MotorFrame.empty(ctx.robot_layout)
         self._live_frame = MotorFrame.empty(ctx.robot_layout)
         self._normal_frame = MotorFrame.empty(ctx.robot_layout)
+        self._disarm_frame = MotorFrame.empty(ctx.robot_layout)
         self._prepare_applied_target_mapping(ctx.last_motor_frame.layout)
         self._copy_frame(self._entry_frame, ctx.last_motor_frame)
         self._copy_frame(self._applied_frame, ctx.last_motor_frame)
@@ -210,6 +213,7 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
             ZeroLabArmPhase.WAIT_STREAM,
             ZeroLabArmPhase.WAIT_ARM,
             ZeroLabArmPhase.BLENDING,
+            ZeroLabArmPhase.DISARMING,
         )
 
     def on_update(self, ctx: RobotControlContext, dt: float) -> None:
@@ -325,6 +329,35 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
                 self._recovery_notice_logged = True
             return self._copy_frame(self._applied_frame, self._live_frame)
 
+        if self._arm_phase is ZeroLabArmPhase.DISARMING:
+            assert self._disarm_frame is not None
+            self._blend_elapsed_s += max(dt, 0.0)
+            alpha = self._smoothstep(
+                self._blend_elapsed_s / self.arm_blend_seconds
+            )
+            normal = self._sample_normal_frame(ctx, dt, advance=True)
+            self._blend_frames(
+                self._disarm_frame,
+                normal,
+                self._applied_frame,
+                alpha,
+            )
+            if self._blend_elapsed_s >= self.arm_blend_seconds:
+                self._copy_frame(self._applied_frame, normal)
+                if fresh_reference:
+                    self._set_phase(
+                        ZeroLabArmPhase.WAIT_ARM,
+                        "ZeroLab ARM phase: WAIT_ARM; manual pause complete",
+                    )
+                else:
+                    self._set_phase(
+                        ZeroLabArmPhase.WAIT_STREAM,
+                        "ZeroLab ARM phase: WAIT_STREAM; manual pause "
+                        "complete; reference stale",
+                        warning=True,
+                    )
+            return self._applied_frame
+
         if self._arm_phase is ZeroLabArmPhase.BLENDING:
             self._blend_elapsed_s += max(dt, 0.0)
             alpha = self._smoothstep(
@@ -384,6 +417,7 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
         self._applied_frame = None
         self._live_frame = None
         self._normal_frame = None
+        self._disarm_frame = None
         self._applied_target_map = None
         self._applied_policy_qpos.fill(0.0)
         self._blend_elapsed_s = 0.0
@@ -404,42 +438,26 @@ class ZeroLabArmedTeleopState(SonicTeleopState):
                 "ZeroLab ARM accepted; blending live Normal -> SONIC for "
                 f"{self.arm_blend_seconds:.3f} s",
             )
-        elif (
-            self.auto_rearm_on_recovery
-            and self._initial_arm_completed
-            and self._arm_phase
-            in (
-                ZeroLabArmPhase.HOLD_REFERENCE,
-                ZeroLabArmPhase.REARMING,
-                ZeroLabArmPhase.ARMED,
-            )
-        ):
-            self.logger.info(
-                "ZeroLab ARM ignored; automatic recovery owns "
-                "post-ARM transitions"
-            )
-        elif (
-            self._arm_phase is ZeroLabArmPhase.HOLD_REFERENCE
-            and fresh_reference
-        ):
-            if not self.policy.begin_live_reference_rearm():
-                self.logger.warning(
-                    "ZeroLab recovery ARM refused; no pending reference"
-                )
-            else:
-                self._blend_elapsed_s = 0.0
-                self._set_phase(
-                    ZeroLabArmPhase.REARMING,
-                    "ZeroLab recovery ARM accepted; blending human "
-                    "reference for "
-                    f"{self.auto_rearm_blend_seconds:.3f} s",
-                )
         elif self._arm_phase in (
             ZeroLabArmPhase.BLENDING,
             ZeroLabArmPhase.ARMED,
+            ZeroLabArmPhase.HOLD_REFERENCE,
             ZeroLabArmPhase.REARMING,
         ):
-            self.logger.info("ZeroLab ARM ignored; already active")
+            assert self._applied_frame is not None
+            assert self._disarm_frame is not None
+            self._copy_frame(self._disarm_frame, self._applied_frame)
+            self.policy.release_live_reference_hold()
+            self._blend_elapsed_s = 0.0
+            self._initial_arm_completed = False
+            self._set_phase(
+                ZeroLabArmPhase.DISARMING,
+                "ZeroLab ARM phase: DISARMING; blending SONIC -> live "
+                "Normal for "
+                f"{self.arm_blend_seconds:.3f} s",
+            )
+        elif self._arm_phase is ZeroLabArmPhase.DISARMING:
+            self.logger.info("ZeroLab pause ignored; disarming in progress")
         else:
             self.logger.warning("ZeroLab ARM refused; wait for a fresh reference")
         return True

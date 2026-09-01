@@ -86,7 +86,7 @@ def test_zerolab_event_state_and_routes_are_safe():
     assert params["hardware_gripper"] is False
     assert params["operator_prompt"] == (
         "机器人保持实时Normal直到stream ready；确认操作者处于中立姿势后，"
-        "由安全员发送btn_10=12"
+        "由安全员发送btn_10=12接管；再次发送可暂停并回到WAIT_ARM"
     )
     assert params["arm_blend_seconds"] == 2.0
     assert params["auto_rearm_on_recovery"] is True
@@ -116,6 +116,13 @@ def test_zerolab_event_state_and_routes_are_safe():
         for item in manifest["actions"]
     }
     assert ("sonic_zerolab", "arm_zerolab", "arm_zerolab") in actions
+    arm_action = next(
+        item
+        for item in manifest["actions"]
+        if item["from"] == "sonic_zerolab"
+        and item["event"] == "arm_zerolab"
+    )
+    assert arm_action["manifest"]["label"] == "ZeroLab ARM / 暂停"
     assert not any(
         source == "sonic_teleop" and event == "arm_zerolab"
         for source, event, _action in actions

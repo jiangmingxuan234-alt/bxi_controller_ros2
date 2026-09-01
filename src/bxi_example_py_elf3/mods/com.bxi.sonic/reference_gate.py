@@ -192,6 +192,11 @@ class LiveReferenceGate:
         self._latched = None
         self._rearm_progress = 0.0
 
+    def release_to_live(self) -> None:
+        self._mode = ReferenceGateMode.LIVE
+        self._latched = None
+        self._rearm_progress = 0.0
+
     def reset(self) -> None:
         self._mode = ReferenceGateMode.LIVE
         self._observed = None

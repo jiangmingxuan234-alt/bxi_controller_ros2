@@ -225,3 +225,23 @@ def test_complete_rearm_returns_to_live_with_newest_observed_reference():
 
     assert gate.mode is ReferenceGateMode.LIVE
     assert gate.active_reference().frame_index == 8
+
+
+@pytest.mark.parametrize("rearming", [False, True])
+def test_manual_release_returns_hold_or_rearming_to_newest_live_reference(
+    rearming,
+):
+    gate = LiveReferenceGate()
+    gate.observe(frame(1), received_mono=1.0)
+    assert gate.hold() is True
+    gate.observe(frame(9), received_mono=2.0)
+    if rearming:
+        assert gate.begin_rearm() is True
+        gate.set_rearm_progress(0.25)
+
+    gate.release_to_live()
+
+    assert gate.mode is ReferenceGateMode.LIVE
+    assert gate.active_reference().frame_index == 9
+    gate.observe(frame(12), received_mono=3.0)
+    assert gate.active_reference().frame_index == 12

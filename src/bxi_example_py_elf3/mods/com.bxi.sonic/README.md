@@ -601,6 +601,9 @@ sleep 1
 vendor N-pose -> operator neutral -> btn_10=11 -> WAIT_STREAM
 -> WAIT_ARM -> initial btn_10=12 -> 2 s BLENDING -> ARMED
 
+ARMED/BLENDING/HOLD_REFERENCE/REARMING -> btn_10=12
+-> 2 s DISARMING -> live Normal -> WAIT_ARM (fresh) or WAIT_STREAM (stale)
+
 gap <= 0.5 s: 40 ms buffered playout -> held reference if needed
 -> automatic 0.2 s short recovery -> remains ARMED
 
@@ -618,6 +621,12 @@ gap > 0.5 s: HOLD_REFERENCE -> 10 new real valid UDP packets
 Normal 输出；新 generation 重新满足 10 个真实有效包后只回到 `WAIT_ARM`，不能由旧数据
 或合成帧直接接管。安全员必须重新确认中立姿势并再次发送初次 ARM；只有初次 blend 成功到达
 `ARMED` 后，后续 dropout 恢复才无需第二次 ARM。
+
+需要暂停人体接管而继续保持 ZeroLab 链路时，再发送一次 `btn_10=12`。系统从当前实际应用的
+SONIC 电机目标出发，在 2.0 秒内平滑过渡到持续更新的零速度 Normal policy；输入仍通过
+source、5558 和 5557 更新，但不会控制机器人。数据仍新鲜时完成于 `WAIT_ARM`，数据已 stale
+时完成于 `WAIT_STREAM`。操作者调整并回到中立姿势、日志再次显示 `WAIT_ARM` 后，再发送
+`btn_10=12` 即可重新执行 2.0 秒 Normal 到 SONIC 接管，无需重新发送 `btn_10=11`。
 
 `ARMED` 中的 40 ms jitter buffer 在 50 Hz playout 时钟上做真实帧或插值输出；短缺包时
 可暂时保持最后 reference。未越过 stale 边界而恢复真实输入时，系统自动执行 0.2 秒
@@ -659,7 +668,8 @@ ARM 后的 2.0 秒交接期间继续保持中立姿态。两秒 blend 可以减�
 电机命令。此时必须收到同一新 generation 的 10 个真实有效 UDP 包；随后系统无需第二次
 ARM 按键，自动在 reference space 内执行 2.0 秒 `REARMING` 并回到 `ARMED`。默认
 `auto_rearm_on_recovery: true` 时，初次 ARM 之后再发送 `btn_10=12` 不会重启
-`HOLD_REFERENCE`、`REARMING` 或 `ARMED` 阶段。
+`HOLD_REFERENCE`、`REARMING` 或 `ARMED` 阶段，而是取消当前人体接管并进入
+`DISARMING`。紧急情况不要等待此平滑阶段，应直接进入 PD brake。
 
 自动恢复没有人体 pose-difference gate，也不会验证操作者恢复后的姿势是否接近断流前姿势。
 如果 sender 长时间断开，操作者必须先主动回到中立姿势，再有意恢复 sender。没有支撑架、可用

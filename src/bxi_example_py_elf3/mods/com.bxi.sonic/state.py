@@ -99,6 +99,9 @@ class SonicPolicy(Protocol):
     def complete_live_reference_rearm(self) -> None:
         ...
 
+    def release_live_reference_hold(self) -> None:
+        ...
+
     def reset_yaw_alignment(self) -> None:
         ...
 
