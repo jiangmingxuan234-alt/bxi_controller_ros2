@@ -21,6 +21,9 @@ PYTHONPATH="$CAND/src/bxi_example_py_elf3:$CAND/src/bxi_example_py_elf3/mods/com
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 python3 -m pytest -q src/bxi_example_py_elf3/test
 
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+python3 -m pytest -q script/test_zerolab_services.py
+
 colcon --log-base log-wireless-auto-recovery build \
   --merge-install \
   --base-paths src \
@@ -78,18 +81,69 @@ sudo systemctl enable ros_elf_launch.service
 ```
 
 `enable` 只设置下次开机启动；上面的步骤不会立即启动电机控制器。
+`zerolab-network.service` 是长驻自愈服务：NetworkManager、DHCP 或网线重连
+清除 `/32` 后会在 `2 s` 内补回，同时维持 `wlo1.arp_ignore=1`。升级旧的
+oneshot 版本时必须先停止旧 unit，再替换 helper；旧版本留下的
+`/run/zerolab-network` 会由新 helper 幂等清理。
 
 ## 3. 首次受控启动
 
-仍保持可靠支撑和急停准备：
+仍保持可靠支撑和急停准备。先只启动网络服务，禁止发送 `btn_10=12`：
 
 ```bash
 set -e
 
 sudo systemctl start zerolab-network.service
 
+systemctl is-active zerolab-network.service
 ip -4 -br addr show enp86s0
+ip -4 addr show dev enp86s0 | grep -F 'inet 192.168.88.213/32 '
 test "$(cat /proc/sys/net/ipv4/conf/wlo1/arp_ignore)" = 1
+```
+
+在硬件服务仍停止时，主动制造与 NetworkManager 重配相同的漂移：
+
+```bash
+set -e
+
+sudo ip address delete 192.168.88.213/32 dev enp86s0
+sudo sysctl -w net.ipv4.conf.wlo1.arp_ignore=0
+sleep 2
+
+ip -4 addr show dev enp86s0 | grep -F 'inet 192.168.88.213/32 '
+test "$(cat /proc/sys/net/ipv4/conf/wlo1/arp_ignore)" = 1
+```
+
+验证停止服务会恢复启动前的状态，再重新启动网络服务：
+
+```bash
+set -e
+
+sudo systemctl stop zerolab-network.service
+
+if ip -4 addr show dev enp86s0 |
+  grep -Fq 'inet 192.168.88.213/32 '
+then
+  echo 'STOP: ZeroLab地址未回退'
+  exit 1
+fi
+test "$(cat /proc/sys/net/ipv4/conf/wlo1/arp_ignore)" = 0
+test ! -d /run/zerolab-network
+
+sudo systemctl start zerolab-network.service
+```
+
+ZeroLab 发送端开启后，在 ARM 前验证严格匹配的 UDP：
+
+```bash
+sudo timeout 10 tcpdump \
+  -ni enp86s0 -nn -c 20 \
+  'udp and src host 192.168.89.171 and dst host 192.168.88.213 and dst port 18000'
+```
+
+只有以上网络检查全部通过后，才启动候选硬件和平板服务：
+
+```bash
 
 sudo systemctl start zerolab-hardware.service
 sudo systemctl start ros_elf_launch.service
@@ -130,14 +184,6 @@ cat /proc/sys/net/ipv4/conf/wlo1/arp_ignore
 期望只有一个 `hardware_elf3` 和一个 `bxi_example_py_elf3_demo`，并且
 `/motion_commands` 的订阅者数量为 1。
 
-ZeroLab 发送端开启后，在 ARM 前验证原始 UDP：
-
-```bash
-sudo timeout 10 tcpdump \
-  -ni enp86s0 -nn -c 20 \
-  'udp and src host 192.168.89.171 and dst host 192.168.88.213 and dst port 18000'
-```
-
 ## 5. 平板操作
 
 ```text
@@ -176,3 +222,5 @@ sudo systemctl enable --now ros_elf_launch.service
 
 停止 `zerolab-network.service` 会删除由该服务添加的
 `192.168.88.213/32`，并将 `net.ipv4.conf.wlo1.arp_ignore` 恢复为服务启动前的值。
+地址已被 NetworkManager 提前删除时也视为幂等清理成功；如果地址在服务启动前已经
+存在，停止服务会保留或恢复该地址。

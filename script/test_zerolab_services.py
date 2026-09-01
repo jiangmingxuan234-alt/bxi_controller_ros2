@@ -116,8 +116,15 @@ def test_network_unit_uses_transactional_helper():
     unit = (SCRIPT_DIR / "zerolab-network.service").read_text()
 
     assert NETWORK_HELPER.exists()
-    assert "ExecStart=/usr/local/libexec/zerolab-network-config start" in unit
-    assert "ExecStop=/usr/local/libexec/zerolab-network-config stop" in unit
+    assert "Type=notify" in unit
+    assert "NotifyAccess=main" in unit
+    assert "Restart=on-failure" in unit
+    assert "RestartSec=1s" in unit
+    assert "Environment=ZEROLAB_RECONCILE_SECONDS=1" in unit
+    assert "ExecStart=/usr/local/libexec/zerolab-network-config run" in unit
+    assert "ExecStop=" not in unit
+    assert "RemainAfterExit=" not in unit
+    assert "Before=zerolab-hardware.service" in unit
     assert "ExecStart=/usr/sbin/ip " not in unit
     assert "ExecStart=/usr/sbin/sysctl " not in unit
 

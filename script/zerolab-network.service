@@ -5,17 +5,21 @@ After=NetworkManager.service network-online.target
 Before=zerolab-hardware.service
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
+Type=notify
+NotifyAccess=main
+Restart=on-failure
+RestartSec=1s
+TimeoutStopSec=10s
 ExecStartPre=/usr/bin/test -d /sys/class/net/enp86s0
 ExecStartPre=/usr/bin/test -d /sys/class/net/wlo1
 Environment=ZEROLAB_IP_BIN=/usr/sbin/ip
 Environment=ZEROLAB_SYSCTL_BIN=/usr/sbin/sysctl
+Environment=ZEROLAB_SYSTEMD_NOTIFY_BIN=/usr/bin/systemd-notify
 Environment=ZEROLAB_NETWORK_STATE_DIR=/run/zerolab-network
 Environment=ZEROLAB_ETH=enp86s0
 Environment=ZEROLAB_WIFI=wlo1
-ExecStart=/usr/local/libexec/zerolab-network-config start
-ExecStop=/usr/local/libexec/zerolab-network-config stop
+Environment=ZEROLAB_RECONCILE_SECONDS=1
+ExecStart=/usr/local/libexec/zerolab-network-config run
 
 [Install]
 WantedBy=multi-user.target
