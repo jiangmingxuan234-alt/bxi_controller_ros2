@@ -18,6 +18,12 @@ case "$STATE_DIR" in
     ;;
 esac
 
+address_present()
+{
+  "$IP_BIN" -4 address show dev "$ETH" |
+    grep -Fq "inet $ADDRESS "
+}
+
 stop_network()
 {
   STOP_RC=0
@@ -42,7 +48,10 @@ stop_network()
   fi
 
   if [ -f "$STATE_DIR/address.added" ]; then
-    if "$IP_BIN" address delete "$ADDRESS" dev "$ETH"
+    if ! address_present
+    then
+      rm -f "$STATE_DIR/address.added"
+    elif "$IP_BIN" address delete "$ADDRESS" dev "$ETH"
     then
       rm -f "$STATE_DIR/address.added"
     else

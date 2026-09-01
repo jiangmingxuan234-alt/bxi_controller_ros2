@@ -179,15 +179,29 @@ exit 0
 def test_network_helper_retains_failed_cleanup_for_retry(tmp_path):
     log = tmp_path / "commands.log"
     delete_failed = tmp_path / "delete-failed"
+    address_state = tmp_path / "address-present"
     fake_ip = tmp_path / "ip"
     fake_sysctl = tmp_path / "sysctl"
     state_dir = tmp_path / "state"
     _write_executable(
         fake_ip,
         """printf 'ip %s\\n' "$*" >> "$ZEROLAB_TEST_LOG"
+if [ "$1 $2 $3 $4" = "-4 address show dev" ]; then
+  if [ -f "$ZEROLAB_ADDRESS_STATE" ]; then
+    printf '    inet 192.168.88.213/32 scope global enp-test\\n'
+  fi
+  exit 0
+fi
+if [ "$1 $2" = "address add" ]; then
+  : > "$ZEROLAB_ADDRESS_STATE"
+  exit 0
+fi
 if [ "$1 $2" = "address delete" ] && [ ! -f "$ZEROLAB_DELETE_FAILED" ]; then
   : > "$ZEROLAB_DELETE_FAILED"
   exit 25
+fi
+if [ "$1 $2" = "address delete" ]; then
+  rm -f "$ZEROLAB_ADDRESS_STATE"
 fi
 exit 0
 """,
@@ -211,6 +225,7 @@ exit 0
             "ZEROLAB_WIFI": "wlan-test",
             "ZEROLAB_TEST_LOG": str(log),
             "ZEROLAB_DELETE_FAILED": str(delete_failed),
+            "ZEROLAB_ADDRESS_STATE": str(address_state),
         }
     )
 
@@ -231,6 +246,47 @@ exit 0
 
     assert second_stop.returncode == 0
     assert not state_dir.exists()
+
+
+def test_network_helper_treats_missing_owned_address_as_clean(tmp_path):
+    log = tmp_path / "commands.log"
+    fake_ip = tmp_path / "ip"
+    fake_sysctl = tmp_path / "sysctl"
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "address.added").touch()
+    _write_executable(
+        fake_ip,
+        """printf 'ip %s\\n' "$*" >> "$ZEROLAB_TEST_LOG"
+if [ "$1 $2 $3 $4" = "-4 address show dev" ]; then
+  exit 0
+fi
+if [ "$1 $2" = "address delete" ]; then
+  exit 25
+fi
+exit 0
+""",
+    )
+    _write_executable(fake_sysctl, "exit 0\n")
+    env = os.environ.copy()
+    env.update(
+        {
+            "ZEROLAB_IP_BIN": str(fake_ip),
+            "ZEROLAB_SYSCTL_BIN": str(fake_sysctl),
+            "ZEROLAB_NETWORK_STATE_DIR": str(state_dir),
+            "ZEROLAB_ETH": "enp-test",
+            "ZEROLAB_WIFI": "wlan-test",
+            "ZEROLAB_TEST_LOG": str(log),
+        }
+    )
+
+    result = subprocess.run(
+        [str(NETWORK_HELPER), "stop"], env=env, check=False
+    )
+
+    assert result.returncode == 0
+    assert not state_dir.exists()
+    assert "ip address delete" not in log.read_text()
 
 
 def test_upgrade_stops_legacy_network_unit_before_replacing_it():
