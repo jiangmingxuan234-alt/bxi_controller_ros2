@@ -345,6 +345,12 @@ void test_standalone_zerolab_buttons_emit_one_pulse_per_press()
     };
     const RemoteConfig config = remote_controller::load_remote_config(
         REMOTE_CONTROLLER_TEST_CONFIG_PATH);
+    const char *modifier_sources[] = {
+        "js.button.6",
+        "js.button.7",
+        "js.axis.5",
+        "js.axis.4",
+    };
 
     for (const Case &item : cases) {
         InputMapper mapper(config);
@@ -358,11 +364,43 @@ void test_standalone_zerolab_buttons_emit_one_pulse_per_press()
         mapper.fill_message(held);
         expect(held.btn_10 == 0);
 
+        for (const char *modifier : modifier_sources) {
+            mapper.set_signal(modifier, 1.0);
+            communication::msg::MotionCommands chord;
+            mapper.fill_message(chord);
+
+            mapper.set_signal(modifier, 0.0);
+            communication::msg::MotionCommands modifier_released;
+            mapper.fill_message(modifier_released);
+            expect(modifier_released.btn_10 != item.expected);
+        }
+
         mapper.set_signal(item.source, 0.0);
         mapper.set_signal(item.source, 1.0);
         communication::msg::MotionCommands pressed_again;
         mapper.fill_message(pressed_again);
         expect(pressed_again.btn_10 == item.expected);
+    }
+
+    for (const Case &item : cases) {
+        for (const char *modifier : modifier_sources) {
+            InputMapper mapper(config);
+            mapper.set_signal(modifier, 1.0);
+            mapper.set_signal(item.source, 1.0);
+            communication::msg::MotionCommands chord;
+            mapper.fill_message(chord);
+
+            mapper.set_signal(modifier, 0.0);
+            communication::msg::MotionCommands modifier_released;
+            mapper.fill_message(modifier_released);
+            expect(modifier_released.btn_10 != item.expected);
+
+            mapper.set_signal(item.source, 0.0);
+            mapper.set_signal(item.source, 1.0);
+            communication::msg::MotionCommands clean_press;
+            mapper.fill_message(clean_press);
+            expect(clean_press.btn_10 == item.expected);
+        }
     }
 }
 

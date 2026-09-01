@@ -817,6 +817,17 @@ void load_bindings(const YAML::Node &node, RemoteConfig &config, const std::stri
         binding.mode = mode;
         binding.when = load_condition(
             item["when"], config, "outputs." + mode + "[].when");
+        if (item["edge_when"]) {
+            if (mode != "edge") {
+                throw std::runtime_error(
+                    "edge_when is only supported under outputs.edge");
+            }
+            binding.has_edge_when = true;
+            binding.edge_when = load_condition(
+                item["edge_when"],
+                config,
+                "outputs.edge[].edge_when");
+        }
         if (binding.output.empty()) {
             throw std::runtime_error("binding must contain output and when");
         }
@@ -1214,6 +1225,12 @@ void validate_config(RemoteConfig &config)
         }
         std::set<std::string> binding_controls;
         collect_condition_references(binding.when, binding_controls, used_raw_sources);
+        if (binding.has_edge_when) {
+            collect_condition_references(
+                binding.edge_when,
+                binding_controls,
+                used_raw_sources);
+        }
         for (const auto &control : binding_controls) {
             used_controls.insert(control);
             if (control_names.count(control) == 0) {

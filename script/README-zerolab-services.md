@@ -60,6 +60,9 @@ sudo cp -n \
 sudo install -m 0644 \
   "$CAND/script/zerolab-network.service" \
   /etc/systemd/system/zerolab-network.service
+sudo install -D -m 0755 \
+  "$CAND/script/zerolab-network-config" \
+  /usr/local/libexec/zerolab-network-config
 sudo install -m 0644 \
   "$CAND/script/zerolab-hardware.service" \
   /etc/systemd/system/zerolab-hardware.service
@@ -170,5 +173,5 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now ros_elf_launch.service
 ```
 
-停止 `zerolab-network.service` 会删除 `192.168.88.213/32` 并将
-`net.ipv4.conf.wlo1.arp_ignore` 恢复为 `0`。
+停止 `zerolab-network.service` 会删除由该服务添加的
+`192.168.88.213/32`，并将 `net.ipv4.conf.wlo1.arp_ignore` 恢复为服务启动前的值。

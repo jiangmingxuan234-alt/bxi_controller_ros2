@@ -331,6 +331,7 @@ outputs:
 
     # 单独 A：从 Normal 进入 SONIC ZeroLab；每次按下只发送一个脉冲。
     - output: btn_10=11
+      edge_when: button.a_event
       when:
         - button.a_event
         - released: shoulder.left_event
@@ -340,6 +341,7 @@ outputs:
 
     # 单独 Y：在 SONIC ZeroLab 内 ARM/暂停；每次按下只发送一个脉冲。
     - output: btn_10=12
+      edge_when: button.y_event
       when:
         - button.y_event
         - released: shoulder.left_event

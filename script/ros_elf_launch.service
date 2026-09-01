@@ -1,6 +1,5 @@
 [Unit]
 Description=Elf3 tablet remote controller
-Wants=zerolab-hardware.service
 After=zerolab-hardware.service
 
 [Service]

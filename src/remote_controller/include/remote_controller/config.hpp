@@ -91,6 +91,8 @@ struct Binding {
     std::string output;
     std::string mode;
     ConditionConfig when;
+    bool has_edge_when = false;
+    ConditionConfig edge_when;
 };
 
 struct CurvePoint {
